@@ -280,6 +280,7 @@ impl Engine {
             config.default_harness,
         )?;
         tracing::info!(device_id = %core.device_id, "local engine core assembled");
+        zeron_harness::acp::prewarm_managed_adapters();
         Ok(EngineRuntime { core })
     }
 
@@ -295,6 +296,7 @@ impl Engine {
             lock,
         )?;
         tracing::info!(device_id = %core.device_id, "local engine core assembled");
+        zeron_harness::acp::prewarm_managed_adapters();
         Ok(EngineRuntime { core })
     }
 
