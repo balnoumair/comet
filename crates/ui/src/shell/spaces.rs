@@ -13,6 +13,9 @@ use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_pa
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
 
+/// One session inside a project group: (status, chat, branch).
+type Row = (ChatIndicator, zeron_proto::Chat, Option<String>);
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -589,18 +592,15 @@ impl Shell {
                     None => true,
                 })
                 .map(|(status, chat)| {
-                    // Line 1 is "project @ device" (t3code's project row);
+                    // Line 1 is the project name behind a folder mark — the
+                    // card's project identity, which the eye scans first;
                     // project-less sessions read as their home-dir cwd `~`.
                     let space = state.space_for_chat(chat);
-                    let mut folder = match (space, chat.space_id.as_deref()) {
+                    let folder = match (space, chat.space_id.as_deref()) {
                         (Some(space), _) => space.display_name().to_string(),
                         (None, None) => "~".to_string(),
                         (None, Some(_)) => "?".to_string(),
                     };
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder} @ {device}");
-                    }
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
                     let branch = chat
@@ -613,13 +613,46 @@ impl Shell {
                 })
                 .collect()
         };
+        // Cluster by project, keeping `overview_chats`' ordering: a group
+        // lands where its most recent session did, so the project you are
+        // working in still floats to the top and the attention buckets carry
+        // over. Keyed by space id, not display name — two devices can host
+        // folders that print the same.
+        let mut groups: Vec<(Option<String>, String, Vec<Row>)> = Vec::new();
+        for (status, chat, folder, branch) in rows {
+            let key = chat.space_id.clone();
+            match groups.iter_mut().find(|(k, _, _)| *k == key) {
+                Some((_, _, items)) => items.push((status, chat, branch)),
+                None => groups.push((key, folder, vec![(status, chat, branch)])),
+            }
+        }
+
         let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
+        let mut out: Vec<(String, f32, AnyElement)> = Vec::new();
+        for (key, folder, items) in groups {
+            let space_key = key.as_deref().unwrap_or("~").to_string();
+            let collapsed = self.collapsed_spaces.contains(&space_key);
+            // The project reads ONCE, as the group's title — repeating it on
+            // every card was the noise that made a mixed list unscannable.
+            out.push((
+                format!("h:{space_key}"),
+                super::SPACE_HEADER_HEIGHT,
+                self.render_space_header(
+                    space_key.clone(),
+                    folder.into(),
+                    items.len(),
+                    collapsed,
+                    theme,
+                    cx,
+                ),
+            ));
+            if collapsed {
+                continue;
+            }
+            for (status, chat, branch) in items {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
                 let harness = chat.config.as_ref().map(|c| c.harness);
                 let element = self.render_chat_row(
                     chat.id.clone(),
@@ -628,7 +661,6 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
                     branch.map(SharedString::from),
                     harness,
                     status,
@@ -637,9 +669,80 @@ impl Shell {
                     theme,
                     cx,
                 );
-                (format!("c:{}", chat.id), height, element)
+                out.push((format!("c:{}", chat.id), super::CHAT_ROW_HEIGHT, element));
+            }
+        }
+        out
+    }
+
+    /// A project's title above its cluster of sessions: folder mark + name +
+    /// a fold chevron, with the group's air carried in the header's own
+    /// height so the FLIP resort math (which sums the keyed heights) stays
+    /// exact. The whole strip is the toggle — the chevron is the affordance,
+    /// not a separate hit target (the archived shelf reads the same way).
+    /// Folded groups show their session count, matching "Archived (N)".
+    fn render_space_header(
+        &self,
+        space_key: String,
+        name: SharedString,
+        count: usize,
+        collapsed: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("space-header-{space_key}")))
+            .h(px(super::SPACE_HEADER_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_end()
+            .pb(px(4.0))
+            .px(px(Theme::SPACE_SM))
+            .gap(px(Theme::SPACE_XS))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed_spaces.remove(&space_key) {
+                    this.collapsed_spaces.insert(space_key.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                icon(if collapsed {
+                    icons::ALT_ARROW_RIGHT
+                } else {
+                    icons::ALT_ARROW_DOWN
+                })
+                .size(px(11.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                icon(icons::FOLDER)
+                    .size(px(11.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .line_height(px(14.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(name),
+            )
+            .when(collapsed, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from(format!("({count})"))),
+                )
             })
-            .collect()
+            .into_any_element()
     }
 
     /// The sidebar's archived shelf — a direct port of t3code's settled

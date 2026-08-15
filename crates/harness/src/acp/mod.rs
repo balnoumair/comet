@@ -332,15 +332,11 @@ fn cursor_spec() -> AcpAgentSpec {
              set CURSOR_EXECUTABLE to override)",
         // Fallback only: `session/new` advertises the account's models and
         // the wire always wins. Keep this list to well-known public ids.
+        // Auto's current wire id is `default` (named "Auto"); older agents
+        // used `auto-smart` — `cursor::resolve_auto_id` maps a saved pick.
         models: || {
             vec![
-                Model {
-                    id: "auto-smart".into(),
-                    label: "Auto".into(),
-                    description: Some("Cursor picks the model per request".into()),
-                    reasoning_levels: Vec::new(),
-                    options: vec![cursor::optimize_for_option(Some("balanced"))],
-                },
+                cursor::auto_model(),
                 Model {
                     id: "composer-2.5".into(),
                     label: "Composer 2.5".into(),
@@ -836,20 +832,21 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
             .iter()
             .filter_map(|o| o.get("value").and_then(Value::as_str))
             .collect();
-        // `default` is an ALIAS row (Claude Code's "Default (recommended)"),
+        // `default` is Claude Code's "Default (recommended)" alias —
         // duplicating whichever real model the CLI resolves it to — dropped
         // whenever a real row exists (it read as clutter in the picker, user
-        // request). Send-side, a chat that saved `default` still matches the
-        // advertised value exactly.
+        // request). Cursor's Auto router reuses the same id with the name
+        // "Auto"; that row is a real pick and stays. Send-side, a chat that
+        // saved `default` still matches the advertised value exactly.
         let has_real = raw_ids.iter().any(|id| norm_id(id) != "default");
         return model_select
             .iter()
             .filter_map(|o| {
                 let id = o.get("value").and_then(Value::as_str)?;
-                if has_real && norm_id(id) == "default" {
+                let name = o.get("name").and_then(Value::as_str);
+                if has_real && is_dropped_default_alias(id, name) {
                     return None;
                 }
-                let name = o.get("name").and_then(Value::as_str);
                 let description = o.get("description").and_then(Value::as_str);
                 let mut options = wire_options.clone();
                 if let Some(base) = strip_context_hint(id) {
@@ -1168,6 +1165,16 @@ fn norm_id(id: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Claude Code's `default` alias ("Default (recommended)") duplicates a real
+/// model and is dropped from the picker. Cursor's Auto router uses the same
+/// id with the name "Auto" — that row stays.
+fn is_dropped_default_alias(id: &str, name: Option<&str>) -> bool {
+    if norm_id(id) != "default" {
+        return false;
+    }
+    !name.is_some_and(|n| n.trim().eq_ignore_ascii_case("auto"))
+}
+
 /// Whether a model id carries the 1M-context hint, in either spelling: the
 /// display form `opus[1m]` or the SDK-id form `claude-opus-4-6-1m`.
 fn context_hint_1m(id: &str) -> bool {
@@ -1275,7 +1282,10 @@ fn config_option_sets(
                 // `pick_model_id`.
                 let requested = model.map(cursor::strip_variant_suffix);
                 requested
-                    .and_then(|m| cursor::pick_model_id(m, efforts, &available))
+                    .and_then(|m| cursor::resolve_auto_id(m, &available))
+                    .or_else(|| {
+                        requested.and_then(|m| cursor::pick_model_id(m, efforts, &available))
+                    })
                     .or_else(|| requested.and_then(|m| pick_model_value(m, &available, context_1m)))
                     .or_else(|| model.and_then(|m| pick_model_value(m, &available, context_1m)))
                     .map(Value::String)
@@ -3148,6 +3158,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_auto_default_row_stays_in_the_picker() {
+        // Current cursor-agent advertises Auto as `default` named "Auto".
+        // That is the router pick, not Claude's alias — it must survive.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "composer-2.5",
+                "options": [
+                    { "value": "default", "name": "Auto" },
+                    { "value": "composer-2.5", "name": "Composer 2.5" },
+                    { "value": "claude-opus-5", "name": "Opus 5" },
+                ],
+            }],
+        });
+        let models = models_from_session(&response, &(cursor_spec().models)());
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "composer-2.5", "claude-opus-5"]
+        );
+        assert_eq!(models[0].label, "Auto");
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("Cursor picks the model per request")
+        );
+    }
+
+    #[test]
     fn claude_aliases_enrich_from_the_curated_catalog() {
         // Same wire shape, WITH the claude catalog: bare aliases pick up the
         // flagship row's curated label/description/ladder, versioned ids
@@ -3358,7 +3398,7 @@ mod tests {
         );
         let auto = (spec.models)()
             .into_iter()
-            .find(|m| m.id == "auto-smart")
+            .find(|m| m.id == "default" && m.label == "Auto")
             .expect("static Auto");
         assert!(auto.options.iter().any(|o| o.id == "optimize_for"));
         assert_eq!(
@@ -3440,7 +3480,7 @@ mod tests {
                 "type": "select",
                 "currentValue": "composer-2.5",
                 "options": [
-                    { "value": "auto-smart" },
+                    { "value": "default" },
                     { "value": "composer-2.5" },
                 ],
             }, {
@@ -3457,6 +3497,8 @@ mod tests {
         });
         let mut opts = serde_json::Map::new();
         opts.insert("optimize_for".into(), json!("cost"));
+        // A saved exploded Auto id from the old picker maps onto the current
+        // `default` wire value.
         let sets = config_option_sets(
             &cursor,
             Some("auto-smart[optimize_for=balanced]"),
@@ -3465,7 +3507,7 @@ mod tests {
         );
         assert!(
             sets.iter()
-                .any(|(id, v)| id == "model" && v == &json!({ "value": "auto-smart" })),
+                .any(|(id, v)| id == "model" && v == &json!({ "value": "default" })),
             "{sets:?}"
         );
         assert!(

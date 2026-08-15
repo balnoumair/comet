@@ -3196,13 +3196,14 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
 
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
 /// fold (`models_from_session`) for catalogs served by OLDER engines (the
-/// space's device may run any version): the `default` alias row drops when a
-/// real row exists, an orphan `<model>[1m]` variant presents as its base id
-/// with the Context Window trait pinned to 1M, and Claude rows adopt the
-/// curated catalog's labels so the version number always shows ("Opus 5",
-/// not the wire's terse "Opus" alias — user request). Idempotent over
-/// already-clean lists. The send path recomposes the advertised id from the
-/// base + trait (`pick_model_value`), so a folded pick still runs.
+/// space's device may run any version): Claude's `default` alias row drops
+/// when a real row exists, Cursor's Auto router (`default` named "Auto")
+/// stays, an orphan `<model>[1m]` variant presents as its base id with the
+/// Context Window trait pinned to 1M, and Claude rows adopt the curated
+/// catalog's labels so the version number always shows ("Opus 5", not the
+/// wire's terse "Opus" alias — user request). Idempotent over already-clean
+/// lists. The send path recomposes the advertised id from the base + trait
+/// (`pick_model_value`), so a folded pick still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
@@ -3232,10 +3233,14 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
     };
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
-    models
+    let models: Vec<Model> = models
         .into_iter()
         .filter_map(|mut model| {
-            if has_real && model.id.eq_ignore_ascii_case("default") {
+            if has_real
+                && model.id.eq_ignore_ascii_case("default")
+                && !model.label.trim().eq_ignore_ascii_case("auto")
+                && harness != HarnessId::Cursor
+            {
                 return None;
             }
             if let Some(base) = strip_1m(&model.id.clone()) {
@@ -3277,7 +3282,47 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             }
             Some(model)
         })
-        .collect()
+        .collect();
+    if harness == HarnessId::Cursor {
+        pin_cursor_auto(models)
+    } else {
+        models
+    }
+}
+
+fn is_cursor_auto_row(model: &Model) -> bool {
+    model.label.trim().eq_ignore_ascii_case("auto")
+        || matches!(
+            model
+                .id
+                .split_once('[')
+                .map(|(b, _)| b)
+                .unwrap_or(model.id.as_str()),
+            "default" | "auto-smart" | "auto"
+        )
+}
+
+/// Cursor's Auto router always leads the list. Older engines drop the wire
+/// `default` row as Claude's alias — put it back so the picker still shows it.
+fn pin_cursor_auto(mut models: Vec<Model>) -> Vec<Model> {
+    if let Some(ix) = models.iter().position(is_cursor_auto_row) {
+        if ix != 0 {
+            let auto = models.remove(ix);
+            models.insert(0, auto);
+        }
+        return models;
+    }
+    models.insert(
+        0,
+        Model {
+            id: "default".into(),
+            label: "Auto".into(),
+            description: Some("Cursor picks the model per request".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+    );
+    models
 }
 
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
@@ -3667,6 +3712,32 @@ mod tests {
         // Idempotent over a clean list.
         let clean = vec![bare_model("titan-5", "Titan 5")];
         assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
+
+        // Cursor Auto is `default` named "Auto" — keep it. Claude-style
+        // "Default (recommended)" on a non-Cursor harness still drops.
+        let cursor = normalize_model_rows(
+            HarnessId::Cursor,
+            vec![
+                bare_model("default", "Auto"),
+                bare_model("composer-2.5", "Composer 2.5"),
+            ],
+        );
+        assert_eq!(
+            cursor.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "composer-2.5"]
+        );
+        assert_eq!(cursor[0].label, "Auto");
+
+        // An older engine that already dropped Auto still gets the row.
+        let injected = normalize_model_rows(
+            HarnessId::Cursor,
+            vec![bare_model("composer-2.5", "Composer 2.5")],
+        );
+        assert_eq!(
+            injected.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "composer-2.5"]
+        );
+        assert_eq!(injected[0].label, "Auto");
     }
 
     #[test]
