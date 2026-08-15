@@ -374,14 +374,21 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
-/// Flex gap between sidebar list items.
-const SIDEBAR_LIST_GAP: f32 = 2.0;
+/// Session card height (FLIP estimate): the 17px title line + 6px gap + the
+/// 14px meta line (branch left, harness mark right), inside 10px of vertical
+/// padding. The project no longer costs the card a line — it titles the group
+/// instead — so the space bought back goes to the card's own breathing room.
+const CHAT_ROW_HEIGHT: f32 = 57.0;
+
+/// Project-title height (FLIP estimate): the 14px label plus the air that
+/// separates one project's cluster from the last card of the previous one.
+/// The gap lives INSIDE the header so the resort math, which sums these
+/// heights, does not have to special-case group boundaries.
+const SPACE_HEADER_HEIGHT: f32 = 30.0;
+/// Flex gap between sidebar list items. Wide enough that consecutive cards
+/// read as separate projects on a fill-less glass column — the rows carry no
+/// border of their own, so this gap is the separation.
+const SIDEBAR_LIST_GAP: f32 = 6.0;
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -732,6 +739,11 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
+    /// Projects whose session cluster is folded away, by space id (`~` for
+    /// the project-less group). Session-transient like `archived_open`, and
+    /// a COLLAPSED set rather than an expanded one so a newly appearing
+    /// project is open by default.
+    pub(super) collapsed_spaces: std::collections::HashSet<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -969,6 +981,7 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
+            collapsed_spaces: std::collections::HashSet::new(),
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -2920,7 +2933,6 @@ impl Shell {
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
         branch: Option<SharedString>,
         harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
@@ -3079,10 +3091,10 @@ impl Shell {
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
             .flex_col()
-            .gap(px(2.0))
+            .gap(px(6.0))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
+            .py(px(10.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             // No selection ring (user request) — the wash alone marks the
@@ -3117,7 +3129,9 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: "project @ device", status word / time-ago right.
+            // Line 1: the session title, with the status word / time-ago in
+            // the corner. The project is NOT repeated here — it titles the
+            // whole group above (see `render_space_header`).
             .child(
                 div()
                     .w_full()
@@ -3130,70 +3144,78 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .child(title),
                     )
                     .child(div().text_color(subline).child(corner)),
             )
-            // Line 2: the session title, flush left (t3code card line 2).
+            // Line 2 (always): the branch reads from the left, badges hug the
+            // right edge — harness brand mark in the card's bottom-right
+            // corner, the working spinner beside it. Pinned to the 14px text
+            // line so a session with neither branch nor harness still spends
+            // CHAT_ROW_HEIGHT (the FLIP resort math reads that as fixed).
             .child(
                 div()
                     .w_full()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .child(title),
-            )
-            // Line 3 (always): harness brand mark; worktree sessions append
-            // the branch icon + name.
-            .child(
-                div()
-                    .w_full()
+                    .h(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
+                    .gap(px(Theme::SPACE_SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when_some(branch, |el, branch| {
+                                el.child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(subline),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .line_height(px(14.0))
+                                        .text_color(subline)
+                                        .child(branch),
+                                )
+                            }),
                     )
-                    .when_some(branch, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(subline),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    })
-                    // Working rows animate the spinner at the row's
-                    // bottom-right (the status word keeps its dot up top).
-                    .when(status == zeron_proto::ChatIndicator::Working, |el| {
-                        el.child(div().flex_1())
-                            .child(loaders::mini_gradient_spinner(
-                                format!("chat-working-{id}"),
-                                2.0,
-                                cx.entity_id(),
-                                cx,
-                            ))
-                    }),
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when(status == zeron_proto::ChatIndicator::Working, |el| {
+                                el.child(loaders::mini_gradient_spinner(
+                                    format!("chat-working-{id}"),
+                                    2.0,
+                                    cx.entity_id(),
+                                    cx,
+                                ))
+                            })
+                            .when_some(
+                                harness.map(crate::pickers::harness_brand_icon),
+                                |el, (path, tint)| {
+                                    el.child(
+                                        icon(path)
+                                            .size(px(11.0))
+                                            .flex_none()
+                                            .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    )
+                                },
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -3340,7 +3362,7 @@ impl Shell {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
+                                    .gap(px(SIDEBAR_LIST_GAP))
                                     .pb(px(Theme::SPACE_SM))
                                     .children(list_items)
                                     .into_any_element()
