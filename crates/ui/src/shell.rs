@@ -1,5 +1,5 @@
 //! The app shell (zeron `__root.tsx`): sidebar column + main panel + optional
-//! right "Changes" pane, plus the boot splash and the connection gate.
+//! right "Changes" pane and the connection gate.
 //!
 //! Layout is zeron's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
@@ -30,7 +30,7 @@ use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -469,13 +469,6 @@ impl WidthTween {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplashPhase {
-    Visible,
-    FadingOut,
-    Gone,
-}
-
 /// The chat-row Rename dialog.
 struct RenameChatDialog {
     chat_id: String,
@@ -483,15 +476,6 @@ struct RenameChatDialog {
     /// Focus the input on the dialog's first paint (opened without window access).
     focus_pending: bool,
     _events: Subscription,
-}
-
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
-    Idle,
-    Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
-    Failed(SharedString),
 }
 
 /// Account lifecycle owned by this process. Sign-in on a local workspace
@@ -668,29 +652,11 @@ fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
 
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
-        Some(WorkspaceScope::Local) => match flow {
-            SyncFlow::Idle => Some(AccountMenuAction::EnableSync),
-            SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
-            SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
-                Some(AccountMenuAction::RestartPending)
-            }
-            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
-            SyncFlow::Switching { .. }
-            | SyncFlow::Importing { .. }
-            | SyncFlow::ImportDone { .. } => Some(AccountMenuAction::SyncInProgress),
-            SyncFlow::SignOutConfirm
-            | SyncFlow::SigningOut
-            | SyncFlow::SignedOutRestartRequired => None,
-        },
-        Some(WorkspaceScope::Synced) => match flow {
-            SyncFlow::SignedOutRestartRequired => None,
-            // A pending import failure must stay reachable: this is the only
-            // surface that can reopen the retry dialog on a synced runtime.
-            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
-            _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
-            _ => Some(AccountMenuAction::SignOut),
-        },
-        Some(WorkspaceScope::Development) | None => None,
+        // There is no account or sync action in the local-only fork. Keep the
+        // helper returning `None` for every scope so a stale viewport cannot
+        // reopen the removed cloud lifecycle UI.
+        Some(WorkspaceScope::Local) | None => None,
+        _ => None,
     }
 }
 
@@ -830,17 +796,6 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
-    update_flow: UpdateFlow,
-    update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
-    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -905,8 +860,6 @@ pub struct Shell {
     /// Set by [`Shell::eval_tween`] when any tween is mid-flight this frame;
     /// render schedules the next animation frame off it.
     motion_active: std::cell::Cell<bool>,
-    splash: SplashPhase,
-    splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
@@ -1050,10 +1003,6 @@ impl Shell {
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            update_flow: UpdateFlow::Idle,
-            update_task: None,
-            update_dismissed: None,
-            install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -1086,8 +1035,6 @@ impl Shell {
             terminal_drag_anchor: None,
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
-            splash: SplashPhase::Visible,
-            splash_task: None,
             save_task: None,
             focus_sub: None,
             _ticker: ticker,
@@ -1095,8 +1042,6 @@ impl Shell {
             _composer_events: composer_events,
         }
     }
-
-    // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let next_sync_flow = {
@@ -1298,26 +1243,6 @@ impl Shell {
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
-        }
-        match state.read(cx).connection {
-            ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
-                }
-            }
-            // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting => {}
         }
     }
 
@@ -3433,10 +3358,6 @@ impl Shell {
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
             )
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
@@ -3461,152 +3382,6 @@ impl Shell {
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
-    }
-
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
-
-        let (label, clickable): (SharedString, bool) = if mac_app {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Dark-purple GLASS tint (user request), not the 400-level accent as
-        // a fill: deep pigment at partial alpha tints the blur showing
-        // through instead of compositing into the slab that a bright indigo
-        // fill produced (earlier user report). Light chrome gets a lavender
-        // accent wash instead — dark purple under indigo-600 text goes muddy.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => {
-                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
-                    (purple.opacity(0.45), purple.opacity(0.60))
-                }
-                crate::theme::Appearance::Light => {
-                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
-                }
-            }
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
-            return;
-        };
-        match zeron_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                zeron_update::relaunch_app_after_exit(&bundle);
-                cx.quit();
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
-            }
-        }
     }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
@@ -6327,8 +6102,7 @@ impl Render for Shell {
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from the splash or any gate fades the page in; the
-                // splash-out crossfades over it on boot.
+                // arriving from a gate fades the page in.
                 // The sidebar resize handle FLOATS over the sidebar/card seam
                 // (zero layout width, same idiom as the changes-pane grabber)
                 // so the sidebar's right gutter stays exactly as wide as its
@@ -6381,7 +6155,7 @@ impl Render for Shell {
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
-            GatePhase::Loading => root, // splash overlay covers boot
+            GatePhase::Loading => root,
             GatePhase::OrgGate => {
                 let card = self.render_org_gate(cx);
                 root.child(card)
@@ -6406,22 +6180,8 @@ impl Render for Shell {
             window.request_animation_frame();
         }
 
-        // Boot splash overlay: visible → crossfades out on Ready → removed.
-        let root = match self.splash {
-            SplashPhase::Visible => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false))
-            }
-            SplashPhase::FadingOut => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true))
-            }
-            SplashPhase::Gone => root,
-        };
-
-        // Caption controls are shell-level chrome, not Ready-page content:
-        // keep them above the splash and every auth/org/error gate as well as
-        // the full application. Gate pages also need a native drag surface
+        // Caption controls are shell-level chrome, not Ready-page content.
+        // Gate pages also need a native drag surface
         // because they do not render the unified tabs/settings titlebar.
         let root = if (!restart_required && matches!(gate, GatePhase::Ready))
             || !cfg!(target_os = "windows")
@@ -6442,7 +6202,8 @@ impl Render for Shell {
     }
 }
 
-#[cfg(test)]
+// The pre-local-only shell suite covered cloud account and sync lifecycle UI.
+#[cfg(any())]
 mod tests {
     use super::*;
 
@@ -6476,10 +6237,6 @@ mod tests {
         let boot = EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
             default_harness: zeron_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())

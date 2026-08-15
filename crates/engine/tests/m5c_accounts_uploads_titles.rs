@@ -116,7 +116,7 @@ fn assemble_with_mock(dir: &Path, script: Vec<AgentEvent>) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness { script }));
-    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None).expect("engine assembles")
+    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock).expect("engine assembles")
 }
 
 async fn git(cwd: &Path, args: &[&str]) {

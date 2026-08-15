@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 zeron-proto.workspace = true
-zeron-sync.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true

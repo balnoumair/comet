@@ -142,7 +142,7 @@ pub fn sort_chats(chats: &mut [Chat]) {
 /// The app gate (zeron's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
-    /// Booting / probing — splash covers this.
+    /// Booting / probing — the main view is not ready yet.
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),

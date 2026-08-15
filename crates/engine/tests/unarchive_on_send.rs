@@ -132,7 +132,6 @@ async fn sending_a_message_unarchives_the_chat() {
         &tmp.path().join("data"),
         Arc::new(registry),
         HarnessId::Mock,
-        None,
     )
     .expect("engine core assembles");
 

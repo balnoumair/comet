@@ -232,8 +232,8 @@ pub struct ToolItem {
     /// to one truncated line. Rendered above `detail` in the open card.
     /// Precomputed for the same reason as `detail`.
     pub invocation: Option<Arc<ToolDetail>>,
-    /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
-    /// a one-line summary; expanding offers a lazy "Show full output" fetch.
+    /// Optional key for a locally cached full output; the transcript carries
+    /// a bounded summary until it is expanded.
     pub output_ref: Option<SharedString>,
     /// Full-output size, for the affordance label ("Show full output (12 KB)").
     pub output_bytes: Option<u64>,
@@ -259,8 +259,8 @@ pub enum ToolDetail {
         new_text: Option<Arc<str>>,
     },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
-    /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
-    /// via the sidecar fetch.
+    /// The full diff upgrades this to [`ToolDetail::Diff`] when local detail is
+    /// available.
     Stats {
         stats: Arc<Vec<zeron_doc::ToolDiffStat>>,
     },
@@ -1059,7 +1059,7 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
 }
 
 /// Height of the "Show full output/diff" affordance row appended below an
-/// open detail whose full payload lives in the sidecar (chat2-sync A3).
+/// open detail whose full payload is available in the local journal.
 pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
 
 /// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
@@ -1441,7 +1441,7 @@ pub struct Transcript {
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
-    /// chat2-sync A3). `Ready` holds the UPGRADED detail, built once on
+    /// `Ready` holds the UPGRADED detail, built once on
     /// arrival — render swaps it in per chip; rows never rebuild for it.
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
@@ -2352,58 +2352,14 @@ impl Transcript {
         rows
     }
 
-    /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
-    /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
-    /// is a no-op; Failed re-arms as a retry (the affordance label says so).
+    /// Local-only transcripts keep the complete tool output in the document;
+    /// there is no remote sidecar fetch path.
     fn spawn_blob_fetch(&mut self, blob_ref: SharedString, cx: &mut Context<Self>) {
-        // Rank BEFORE the already-fetched guard: clicking a Ready ref is the
-        // "show me this one again" toggle (recency bump + repaint, no
-        // re-fetch) — with both a diff and an output fetched, the two
-        // affordances must be able to trade places forever.
         self.blob_fetch_counter += 1;
         self.blob_fetch_order
             .insert(blob_ref.clone(), self.blob_fetch_counter);
-        match self.blob_details.get(&blob_ref) {
-            Some(BlobFetch::Ready(_)) => {
-                cx.notify();
-                return;
-            }
-            Some(BlobFetch::Loading(_)) => return,
-            Some(BlobFetch::Failed) | None => {}
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let is_diff = blob_ref.ends_with(".diff");
-        let ref_key = blob_ref.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let reply = crate::attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                zeron_rpc::methods::FETCH_TOOL_BLOB,
-                serde_json::json!({ "blobRef": ref_key.as_ref() }),
-                Duration::from_secs(20),
-            )
-            .await;
-            let fetched = match reply {
-                Ok(value) => {
-                    let text = value
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
-                    blob_detail(text, is_diff)
-                        .map(|d| BlobFetch::Ready(Arc::new(d)))
-                        .unwrap_or(BlobFetch::Failed)
-                }
-                Err(_) => BlobFetch::Failed,
-            };
-            this.update(cx, |this, cx| {
-                this.blob_details.insert(ref_key, fetched);
-                cx.notify();
-            })
-            .ok();
-        });
-        self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
+        self.blob_details.insert(blob_ref, BlobFetch::Failed);
+        cx.notify();
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
@@ -3078,7 +3034,7 @@ impl Transcript {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
-        // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
+        // one, upgraded in place by locally available detail.
         // Resolved per paint (a HashMap probe per chip) so fetched content
         // needs no row rebuild — arrival is a cx.notify, like a fold toggle.
         let details: Vec<Option<Arc<ToolDetail>>> = tools

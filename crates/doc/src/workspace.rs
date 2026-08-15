@@ -1,6 +1,4 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces zeron's
-//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
-//! SessionRoom class, doc id `ws/{orgId}`).
+//! Workspace document schema over `loro` for the local entity index.
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
@@ -15,11 +13,8 @@
 //!   updatedAt}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
-//! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
-//! own session rows, and rows for chats it hosts; title/archived renames are LWW map
-//! sets from any device — matching zeron's Mutate surface. Presence rides the room's
-//! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! zeron's 15s heartbeat writes so liveness never grows the oplog.
+//! The local engine writes its device and session rows, while title/archived
+//! renames use the same field-level LWW representation as other mutations.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
 //! `chrono::DateTime<Utc>` through the `zeron_proto` entity types.
@@ -32,15 +27,8 @@ use zeron_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
-/// Workspace doc schema version. v2 = the spaces overhaul (spaces container,
-/// chat spaceId/lastSeenAt) — a destructive break shipped via a fresh doc/room
-/// (`workspace2` / `ws2/{orgId}`), so no v1 reader exists.
+/// Workspace doc schema version. v2 is the spaces-aware local registry layout.
 pub const WORKSPACE_SCHEMA_VERSION: i64 = 2;
-
-/// Ephemeral presence key for a device (`presence/{deviceId}` → online timestamp).
-pub fn presence_key(device_id: &str) -> String {
-    format!("presence/{device_id}")
-}
 
 /// Everything in the workspace doc, materialized (`read_all`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -647,8 +635,6 @@ pub(crate) struct RawChat {
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
-    #[serde(default)]
-    room_gen: Option<u32>,
 }
 
 impl From<RawChat> for Chat {
@@ -669,7 +655,6 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
-            room_gen: raw.room_gen,
         }
     }
 }
@@ -741,7 +726,6 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
-            room_gen: None,
         }
     }
 

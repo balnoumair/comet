@@ -1,7 +1,4 @@
-//! RegistryDoc unit tests. The merge cases mirror
-//! `edge/src/registry-core.test.ts` — shared vectors; change both together.
-//! The typed-API cases mirror `workspace.rs`'s tests so the drop-in claim is
-//! tested, not asserted.
+//! RegistryDoc unit tests for local merge and typed-API behavior.
 
 use super::*;
 use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
@@ -207,7 +204,7 @@ fn seed_ops_preserve_original_causality() {
 }
 
 #[test]
-fn wire_shapes_match_the_edge() {
+fn wire_shapes_are_stable() {
     // The exact JSON the TS side produces/consumes (registry-core.ts).
     let op: RowOp = serde_json::from_value(json!({
         "kind": "chats", "id": "chat-1", "op": "upsert",
@@ -271,7 +268,6 @@ fn chat(id: &str, device_id: &str) -> Chat {
         harness_session_cwd: None,
         space_id: None,
         last_seen_at: None,
-        room_gen: None,
     }
 }
 

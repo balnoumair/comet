@@ -12,7 +12,6 @@ zeron-doc.workspace = true
 zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
-zeron-update.workspace = true
 zeron-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true

@@ -961,10 +961,10 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
-                // Output summaries, diff stats, and sidecar refs are
+                // Output summaries and diff stats are
                 // deliberately kept: unlike raw tool inputs they are the
                 // transcript's record of what happened, and the strip already
-                // bounded them (docs/chat2-sync.md A1).
+                // bounded them for the local transcript.
                 output: output.clone(),
                 diff: diff.clone(),
                 output_ref: output_ref.clone(),
@@ -1602,12 +1602,8 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
-            // R2 sidecar PARKED (2026-08-10, product call): the fold's
-            // summary/stats ARE the doc's whole record — no refs stamped, no
-            // uploads. Full outputs survive only in the host's local run
-            // journal. To reintroduce: `zeron_doc::sidecar_payload(&event)`
-            // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
-            // still in place and tested.
+            // The summary/stats are the document's bounded record. Full tool
+            // payloads remain local to the run journal.
         }
 
         if let AgentEvent::Done { status, .. } = &event {
