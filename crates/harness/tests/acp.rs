@@ -731,8 +731,11 @@ async fn real_cursor_adapter_end_to_end() {
     );
     let auto = models
         .iter()
-        .find(|m| m.id == "auto-smart")
-        .expect("parameterized Auto id");
+        .find(|m| {
+            m.label.eq_ignore_ascii_case("auto")
+                || matches!(m.id.as_str(), "default" | "auto-smart" | "auto")
+        })
+        .expect("parameterized Auto");
     let optimize = auto
         .options
         .iter()

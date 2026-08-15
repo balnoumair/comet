@@ -1,11 +1,13 @@
 //! Cursor ACP model enrichment.
 //!
 //! Cursor's ACP server has two picker shapes on the wire:
-//! - **variants** (default): exploded ids like `auto-smart[optimize_for=balanced]`.
+//! - **variants** (legacy): exploded ids like `auto-smart[optimize_for=balanced]`.
 //! - **parameterized** (`clientCapabilities._meta.parameterizedModelPicker`):
-//!   base ids (`auto-smart`) plus real config options (`optimize_for`,
-//!   `effort`, `fast`, `thinking`, `context`).
+//!   base ids plus real config options (`optimize_for`, `effort`, `fast`,
+//!   `thinking`, `context`).
 //!
+//! Auto is a real router, not a Claude-style alias. Current `cursor-agent`
+//! advertises it as `default` named "Auto"; older agents used `auto-smart`.
 //! Zeron opts into parameterized mode. Auto's Intelligence / Balance / Cost
 //! tiers are the `optimize_for` select advertised on the session. HTML effort
 //! badges still appear on some display names and are stripped.
@@ -173,9 +175,61 @@ pub(crate) fn strip_variant_suffix(id: &str) -> &str {
     id.split_once('[').map(|(b, _)| b).unwrap_or(id)
 }
 
+/// Cursor Auto's wire ids: current agents advertise `default` named "Auto";
+/// older parameterized catalogs used `auto-smart` (and a bare `auto`).
+pub(crate) fn is_auto(id: &str) -> bool {
+    matches!(strip_variant_suffix(id), "default" | "auto-smart" | "auto")
+}
+
+fn is_auto_row(model: &Model) -> bool {
+    is_auto(&model.id) || model.label.trim().eq_ignore_ascii_case("auto")
+}
+
+/// The Auto router row. Current `cursor-agent` accepts `default`; the picker
+/// always leads with this even when the wire (or an older engine) omitted it.
+pub(crate) fn auto_model() -> Model {
+    Model {
+        id: "default".into(),
+        label: "Auto".into(),
+        description: Some("Cursor picks the model per request".into()),
+        reasoning_levels: Vec::new(),
+        options: vec![mode_option(None), optimize_for_option(Some("balanced"))],
+    }
+}
+
+/// Pin Auto at the front of the Cursor catalog; insert it when missing.
+pub(crate) fn ensure_auto(mut models: Vec<Model>) -> Vec<Model> {
+    if let Some(ix) = models.iter().position(is_auto_row) {
+        if ix != 0 {
+            let auto = models.remove(ix);
+            models.insert(0, auto);
+        }
+        return models;
+    }
+    models.insert(0, auto_model());
+    models
+}
+
+/// Map a saved Auto pick onto whichever alias this session actually lists.
+pub(crate) fn resolve_auto_id(requested: &str, available: &[&str]) -> Option<String> {
+    if !is_auto(requested) {
+        return None;
+    }
+    for alias in ["default", "auto-smart", "auto"] {
+        if available.contains(&alias) {
+            return Some(alias.to_owned());
+        }
+    }
+    available
+        .iter()
+        .copied()
+        .find(|id| is_auto(id))
+        .map(str::to_owned)
+}
+
 /// Auto's Optimize For trait (Intelligence / Balance / Cost). Injected on
-/// `auto-smart` even when the current wire model isn't Auto — Cursor's ACP
-/// session only lists parameters for the selected model.
+/// Auto even when the current wire model isn't Auto — Cursor's ACP session
+/// only lists parameters for the selected model.
 pub(crate) fn optimize_for_option(current: Option<&str>) -> ModelOption {
     ModelOption {
         id: "optimize_for".into(),
@@ -330,10 +384,6 @@ fn thought_ladder(option: &Value) -> Option<Vec<ReasoningLevel>> {
     (ladder.len() >= 2).then_some(ladder)
 }
 
-fn is_auto_smart(id: &str) -> bool {
-    strip_variant_suffix(id) == "auto-smart"
-}
-
 /// Majority base ids (no `[key=value]` suffix) → parameterized picker.
 fn looks_parameterized(models: &[Model]) -> bool {
     if models.is_empty() {
@@ -350,11 +400,12 @@ fn looks_parameterized(models: &[Model]) -> bool {
 pub(crate) fn enrich_models(models: Vec<Model>, session: &Value) -> Vec<Model> {
     let options = config_options(session);
     let mode_current = option_current(options, "mode");
-    if looks_parameterized(&models) {
+    let models = if looks_parameterized(&models) {
         enrich_parameterized(models, options, mode_current)
     } else {
         enrich_exploded(models, mode_current)
-    }
+    };
+    ensure_auto(models)
 }
 
 /// Parameterized catalog: base ids + real config options. Cursor's ACP
@@ -408,7 +459,7 @@ fn enrich_parameterized(
             model.options.clear();
             model.reasoning_levels.clear();
             model.options.push(mode.clone());
-            if is_auto_smart(&model.id) {
+            if is_auto(&model.id) {
                 model.options.push(optimize.clone());
             }
             if current_id == Some(model.id.as_str()) {
@@ -638,7 +689,9 @@ mod tests {
             ],
             &json!({ "configOptions": [{ "id": "mode", "currentValue": "agent" }] }),
         );
-        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "default");
+        assert_eq!(models[0].label, "Auto");
+        assert_eq!(models.len(), 3);
         let example = models.iter().find(|m| m.label == "Example").unwrap();
         assert_eq!(
             example.reasoning_levels,
@@ -724,6 +777,82 @@ mod tests {
         let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
         assert!(opus.options.iter().all(|o| o.id == "mode"));
         assert!(opus.reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn parameterized_catalog_treats_wire_default_as_auto() {
+        let models = enrich_models(
+            vec![
+                Model {
+                    id: "default".into(),
+                    label: "Auto".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                },
+                Model {
+                    id: "composer-2.5".into(),
+                    label: "Composer 2.5".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                },
+            ],
+            &json!({
+                "configOptions": [
+                    { "id": "mode", "category": "mode", "currentValue": "agent" },
+                    {
+                        "id": "model",
+                        "category": "model",
+                        "currentValue": "composer-2.5",
+                    },
+                ]
+            }),
+        );
+        let auto = models.iter().find(|m| m.id == "default").unwrap();
+        assert!(auto.options.iter().any(|o| o.id == "optimize_for"));
+        let composer = models.iter().find(|m| m.id == "composer-2.5").unwrap();
+        assert!(composer.options.iter().all(|o| o.id != "optimize_for"));
+    }
+
+    #[test]
+    fn enrich_injects_auto_when_the_wire_omitted_it() {
+        let models = enrich_models(
+            vec![Model {
+                id: "composer-2.5".into(),
+                label: "Composer 2.5".into(),
+                description: None,
+                reasoning_levels: vec![],
+                options: vec![],
+            }],
+            &json!({
+                "configOptions": [
+                    { "id": "mode", "category": "mode", "currentValue": "agent" },
+                ]
+            }),
+        );
+        assert_eq!(models[0].id, "default");
+        assert_eq!(models[0].label, "Auto");
+        assert!(models[0].options.iter().any(|o| o.id == "optimize_for"));
+    }
+
+    #[test]
+    fn resolve_auto_id_maps_saved_aliases_onto_the_advertised_row() {
+        let current = ["default", "composer-2.5"];
+        assert_eq!(
+            resolve_auto_id("auto-smart[optimize_for=cost]", &current).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            resolve_auto_id("default", &current).as_deref(),
+            Some("default")
+        );
+        assert_eq!(resolve_auto_id("composer-2.5", &current), None);
+        let legacy = ["auto-smart", "composer-2.5"];
+        assert_eq!(
+            resolve_auto_id("default", &legacy).as_deref(),
+            Some("auto-smart")
+        );
     }
 
     #[test]
