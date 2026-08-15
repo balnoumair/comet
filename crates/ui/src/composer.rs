@@ -3219,8 +3219,11 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
 }
 
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// candidate list is fetched once per harness/target (`ListCommands`) and
+/// filtered locally per keystroke — no RPC, debounce, or skeleton churn while
+/// typing.
+type SlashCacheKey = (HarnessId, Option<String>);
+
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
@@ -3229,7 +3232,6 @@ struct SlashState {
     active: Option<usize>,
     /// Harness the popup is showing commands for (cache key).
     harness: Option<HarnessId>,
-    request: u64,
     loading: bool,
     error: Option<SharedString>,
     dismissed: Option<(Range<usize>, String)>,
@@ -3308,10 +3310,14 @@ pub struct Composer {
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
+    /// Harness/target currently being warmed up for slash completion. Keeping
+    /// this separate from `slash.token` lets discovery start before the user
+    /// types `/`, and prevents a second request while the first is in flight.
+    slash_fetching: Option<SlashCacheKey>,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
+    /// Advertised commands per harness/target (one `ListCommands` per key per
     /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    slash_cache: HashMap<SlashCacheKey, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -3374,7 +3380,13 @@ impl Composer {
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |this: &mut Self, _, cx| {
+            // Harness catalogs load asynchronously. Start command discovery
+            // as soon as the effective harness is known, rather than making
+            // the first `/` keystroke pay for the agent probe.
+            this.ensure_slash_commands(cx);
+            cx.notify();
+        });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -3429,6 +3441,7 @@ impl Composer {
             mention_task: None,
             mention: FileMentionState::default(),
             slash_task: None,
+            slash_fetching: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
             current_key,
@@ -3454,6 +3467,9 @@ impl Composer {
             _pickers_observe: pickers_observe,
             _input_events: input_events,
         };
+        // The picker may already have a remembered harness on the first
+        // frame; warm its command list immediately when that is possible.
+        composer.ensure_slash_commands(cx);
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
         // `ZERON_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
@@ -3693,7 +3709,7 @@ impl Composer {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
-            if self.slash.token.is_some() || self.slash_task.is_some() {
+            if self.slash.token.is_some() {
                 self.reset_slash(None, cx);
             }
             return;
@@ -3874,8 +3890,9 @@ impl Composer {
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
             .w(px(380.0))
+            .id("file-mention-list")
             .max_h(px(280.0))
-            .overflow_hidden()
+            .overflow_y_scroll()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -3980,6 +3997,90 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
+    /// Device hosting the selected session, when there is one. New-chat
+    /// discovery falls back to the local engine when no remote target exists.
+    fn slash_target(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        state
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .or_else(|| {
+                state
+                    .selected_space_row()
+                    .map(|space| space.device_id.clone())
+            })
+    }
+
+    /// Warm one harness's command list. ACP discovery can launch an agent and
+    /// wait for `available_commands_update`, so this runs as soon as the
+    /// picker resolves a harness instead of on the first slash keystroke.
+    fn ensure_slash_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(harness) = self.pickers.read(cx).resolved(cx).harness else {
+            return;
+        };
+        let target = self.slash_target(cx);
+        let cache_key = (harness, target.clone());
+        if self.slash_cache.contains_key(&cache_key)
+            || self.slash_fetching.as_ref() == Some(&cache_key)
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+
+        self.slash_fetching = Some(cache_key.clone());
+        if self.slash.harness == Some(harness) && self.slash.token.is_some() {
+            self.slash.loading = true;
+        }
+        self.slash_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), target.clone().into());
+            }
+            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
+            this.update(cx, |composer, cx| {
+                // A later request for the same harness/target should own the result.
+                // Normally this cannot happen because `slash_fetching` gates
+                // launches, but the check keeps task replacement harmless.
+                if composer.slash_fetching.as_ref() != Some(&cache_key) {
+                    return;
+                }
+                composer.slash_fetching = None;
+                composer.slash_task = None;
+                let popup_is_current = composer.slash.harness == Some(harness)
+                    && composer.slash.token.is_some()
+                    && composer.slash_target(cx) == target;
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
+                        Ok(commands) => {
+                            if popup_is_current {
+                                composer.slash.error = None;
+                            }
+                            composer.slash_cache.insert(cache_key, commands);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "slash command decode failed");
+                        }
+                    },
+                    Err(err) => {
+                        tracing::debug!(%err, "slash command discovery failed");
+                        if popup_is_current {
+                            composer.slash.error = Some(slash_error_message(&err));
+                        }
+                    }
+                }
+                if popup_is_current {
+                    composer.slash.loading = false;
+                    composer.refilter_slash(cx);
+                } else {
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     /// Track the `/` token on every edit: open/refresh the popup, fetch the
     /// harness's command list on first open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
@@ -4015,55 +4116,18 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
+        let cache_key = (harness, self.slash_target(cx));
+        if self.slash_cache.contains_key(&cache_key) {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
-        self.slash.request = self.slash.request.wrapping_add(1);
+        // Discovery is normally already warming in the background. If the
+        // user beats it here, keep the skeleton visible while reusing that
+        // same request instead of launching a duplicate probe.
         self.slash.loading = true;
         self.refilter_slash(cx);
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.slash.loading = false;
-            return;
-        };
-        let target = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
-        };
-        let request = self.slash.request;
-        self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), target.clone().into());
-            }
-            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
-            this.update(cx, |composer, cx| {
-                if composer.slash.request != request {
-                    return;
-                }
-                composer.slash.loading = false;
-                match result {
-                    Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
-                        Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
-                        }
-                        Err(err) => tracing::warn!(%err, "slash command decode failed"),
-                    },
-                    Err(err) => {
-                        tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash.error = Some(slash_error_message(&err));
-                    }
-                }
-                composer.refilter_slash(cx);
-            })
-            .ok();
-        }));
+        self.ensure_slash_commands(cx);
         cx.notify();
     }
 
@@ -4078,7 +4142,7 @@ impl Composer {
         let commands = self
             .slash
             .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .and_then(|h| self.slash_cache.get(&(h, self.slash_target(cx))))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
@@ -4118,7 +4182,7 @@ impl Composer {
             .and_then(|&ix| {
                 self.slash
                     .harness
-                    .and_then(|h| self.slash_cache.get(&h))
+                    .and_then(|h| self.slash_cache.get(&(h, self.slash_target(cx))))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4134,10 +4198,7 @@ impl Composer {
 
     /// Tear down the slash completion (mirrors [`Self::reset_mention`]).
     fn reset_slash(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
-        let request = self.slash.request.wrapping_add(1);
-        self.slash_task = None;
         self.slash = SlashState {
-            request,
             dismissed,
             harness: self.slash.harness,
             ..SlashState::default()
@@ -4154,13 +4215,14 @@ impl Composer {
         let commands = self
             .slash
             .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .and_then(|h| self.slash_cache.get(&(h, self.slash_target(cx))))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
             .w(px(380.0))
+            .id("slash-command-list")
             .max_h(px(280.0))
-            .overflow_hidden()
+            .overflow_y_scroll()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -4268,6 +4330,10 @@ impl Composer {
                 pending_input_request(&s.transcript),
             )
         };
+        // The engine can become available after the composer and picker were
+        // created. Retry the background warm-up when account/session state
+        // publishes that transition.
+        self.ensure_slash_commands(cx);
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
