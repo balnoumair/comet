@@ -111,7 +111,7 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
 
 /// Diff two transcript states into a frame. An entry is upserted when it is
 /// new, its content changed, or its predecessor changed (a Loro list merge can
-/// interleave a remote entry mid-list). Falls back to `Reset` when the delta
+/// interleave an entry mid-list). Falls back to `Reset` when the delta
 /// would carry most of the transcript anyway.
 pub fn diff_transcript(
     prev: &[SessionMessageEntry],

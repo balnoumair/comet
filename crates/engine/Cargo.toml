@@ -11,7 +11,6 @@ zeron-doc.workspace = true
 zeron-sync.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
-zeron-update.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -31,11 +30,8 @@ libc.workspace = true
 gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
-reqwest.workspace = true
 ignore.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio-tungstenite.workspace = true
-# In-process registry server for the two-engine workspace integration tests.
-zeron-sync = { workspace = true, features = ["mock-server"] }

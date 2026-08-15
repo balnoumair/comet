@@ -1,5 +1,4 @@
-//! zeron-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
-//! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
+//! zeron-rpc — the typed local control plane over WebSocket and in-memory transports.
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
 //! byte transports), matching the shape of zeron's Effect RPC without the Effect runtime:
@@ -19,15 +18,9 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
-pub mod device_room;
 mod server;
 
 pub use client::{RpcClient, connect_ws};
-pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
-};
 pub use server::{serve_connection, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
@@ -41,15 +34,6 @@ pub mod methods {
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
-    /// Nudge every open room client to verify liveness NOW (window focus,
-    /// app foregrounded). No params; IPC-only. Each room ignores the hint
-    /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
-    pub const PROBE_SYNC: &str = "ProbeSync";
-    /// Live sync introspection (`zeron sync` / debug surfaces): per-room
-    /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
-    /// counters for the workspace room and every open chat doc. No params;
-    /// IPC-only.
-    pub const SYNC_STATUS: &str = "SyncStatus";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
@@ -59,9 +43,6 @@ pub mod methods {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
-    /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
-    /// the answer is about whichever engine you are directly connected to).
-    pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
     /// Readiness barrier for the engine runtime. The call completes once stores
@@ -71,20 +52,7 @@ pub mod methods {
     /// Headed IPC owners do not implement this method: closing another app's
     /// engine behind its windows would leave that process unusable.
     pub const STOP_ENGINE: &str = "StopEngine";
-    pub const AUTH_STATUS: &str = "AuthStatus";
-    // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
-    pub const SIGN_IN: &str = "SignIn";
-    pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
-    pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
-    pub const SIGN_OUT: &str = "SignOut";
-    pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
-    /// One-time local→synced profile import: what's importable (unary).
-    pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
-    /// One-time local→synced profile import: run it (stream of progress items).
-    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
-    // Repos / worktrees / folders (ControlRpc, relay-forwardable).
+    // Repos / worktrees / folders.
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
     pub const CLONE_REPO: &str = "CloneRepo";
@@ -100,18 +68,17 @@ pub mod methods {
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
-    // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    // Terminals (SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
-    /// Checkout-diff stream for the target device's chats (DataRpc,
-    /// relay-forwardable — diffs are produced where the checkout lives).
+    /// Checkout-diff stream for this engine's chats.
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
-    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
+    // Agent accounts (CLI logins are local to this installation).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
     pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
@@ -119,19 +86,23 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
-    // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
+    // Uploads / attachments (stored locally).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
-    /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
-    pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
-    // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
-    // binary's update). Stream: current UpdateStatus, then every change.
-    pub const UPDATE_STATUS: &str = "UpdateStatus";
-    /// Download + apply the newest release on the target device (symlink-managed
-    /// installs; the service restart is scheduled after the reply flushes).
-    pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Legacy UI method names retained as inert protocol identifiers during the
+    // local-only migration. The local engine does not implement cloud auth or
+    // profile import operations.
+    pub const AUTH_STATUS: &str = "AuthStatus";
+    pub const SIGN_IN: &str = "SignIn";
+    pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
+    pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
+    pub const SIGN_OUT: &str = "SignOut";
+    pub const LIST_ORGS: &str = "ListOrgs";
+    pub const CREATE_ORG: &str = "CreateOrg";
+    pub const SELECT_ORG: &str = "SelectOrg";
+    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
+    pub const LOCAL_DEVICE: &str = "LocalDevice";
 }
 
 #[derive(Debug, thiserror::Error)]

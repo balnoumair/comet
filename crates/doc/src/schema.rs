@@ -1,7 +1,7 @@
-//! Session doc schema over `loro` — Rust port of `packages/session-doc/src/schema.ts`.
+//! Session document schema over `loro`.
 //!
-//! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
-//! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
+//! Container layout is kept stable for local snapshot compatibility:
+//! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }
 //! - `messages`: LoroList of LoroMap {
 //!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
 //! - `commands`: LoroList of LoroMap {
@@ -78,13 +78,13 @@ struct DocPartJson {
     /// Capped inline tool diff (additive; pre-strip writers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff: Option<serde_json::Value>,
-    /// Sidecar key of the full output (additive, docs/chat2-sync.md A1).
+    /// Optional local key of the full output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_ref: Option<String>,
     /// Full-output byte length (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_bytes: Option<u64>,
-    /// Sidecar key of the full diff JSON (additive).
+    /// Optional local key of the full diff JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_ref: Option<String>,
     /// Per-file diff stats (additive).
@@ -594,8 +594,8 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             continuation_of: raw.continuation_of,
         }),
         // 2026-08-10 incident rule: a missing field must cost AT MOST what
-        // the field carried — never the entry, never the transcript. Rooms
-        // merge writes from every device and app version; one bad writer
+        // the field carried — never the entry, never the transcript. Local
+        // snapshots may contain writes from different app versions; one bad writer
         // (or one mangled export) blanking whole sessions for every reader
         // is exactly what tonight looked like.
         Err(strict_err) => salvage_entry(v, strict_err),
@@ -931,7 +931,7 @@ fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
     LoroValue::from(v.clone())
 }
 
-/// Tail sidecar shape (`SessionTail` in TS).
+/// Compact transcript tail shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTail {
@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     /// 2026-08-10 incident: entries/parts missing strict fields must salvage
-    /// field-by-field — a fresh reader importing a room's merged doc must
+    /// field-by-field — a fresh reader importing a merged local doc must
     /// never render a BLANK transcript because some writer (old app version,
     /// other-platform client, mangled export) omitted metadata.
     #[test]

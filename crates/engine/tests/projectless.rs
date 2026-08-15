@@ -120,7 +120,6 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
         &tmp.path().join("data"),
         Arc::new(registry),
         HarnessId::Mock,
-        None,
     )
     .expect("engine core assembles");
 

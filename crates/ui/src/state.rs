@@ -28,7 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
+use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock};
 use zeron_proto::{
     AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
 };
@@ -45,14 +45,6 @@ pub struct EngineBootConfig {
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
-    /// Edge base URL for the embedded engine.
-    pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs offline.
-    pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
-    /// WorkOS client id for production authentication.
-    pub workos_client_id: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -81,7 +73,6 @@ trait EngineBackend: Send + Sync {
 struct InProcessEngine {
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
-    refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
     ipc_task: Option<tokio::task::JoinHandle<()>>,
@@ -106,7 +97,6 @@ impl EngineBackend for InProcessEngine {
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
-        self.refresh_task.abort();
     }
 }
 
@@ -117,11 +107,9 @@ enum DeferredEngineState {
     Failed(String),
 }
 
-/// Serves engine identity and AuthRpc immediately, then holds data calls only
-/// while a captured synced profile still needs organization onboarding.
+/// Serves engine identity immediately while the local stores are assembling.
 /// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
-    auth: AuthRpc,
     engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
     service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
@@ -140,10 +128,6 @@ impl RpcService for DeferredEngineRpc {
                 Err(message) => Err(RpcError::Failed(message)),
             };
         }
-        if AuthRpc::handles(method) {
-            return self.auth.handle(method, params).await;
-        }
-
         let mut state = self.state.clone();
         loop {
             let current = { state.borrow().clone() };
@@ -233,12 +217,8 @@ impl EngineHandle {
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
-            edge_url: config.edge_url,
-            edge_token: config.edge_token,
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
-            org_id: config.org_id,
-            workos_client_id: config.workos_client_id,
         };
 
         // Own the data dir before opening anything under it or binding IPC —
@@ -263,27 +243,18 @@ impl EngineHandle {
             }
         };
 
-        let auth = Engine::build_auth(&engine_config).await;
-        let workspace_scope = Engine::initial_workspace_scope(&auth);
-        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
-        let profile_is_resolved = initial_profile.is_some();
-        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
-        let refresh_task = auth.spawn_refresh_loop();
+        let engine_info = Engine::engine_info(&engine_config)?;
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let assembled_service = Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
-            auth: AuthRpc::new(auth.clone()),
             engine_info: engine_info.clone(),
             state: state_rx.clone(),
             service: assembled_service.clone(),
         });
         let client = memory_client(service.clone());
 
-        // Serve the same service on the IPC port so a terminal viewport can
-        // attach to this window's engine with no setup. Deliberately the
-        // *deferred* service, not the assembled one: a viewport that connects
-        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
-        // its data subscriptions wait exactly as this window's do.
+        // Serve the same service on the IPC port so another local viewport can
+        // attach while the stores are assembling.
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
@@ -302,38 +273,9 @@ impl EngineHandle {
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
         // The instance lock rides into the boot task and is consumed by
-        // assembly — held through sign-in onboarding too, because this process
-        // owns the data dir from the moment it decided to embed.
+        // local assembly.
         let boot_task = tokio::spawn(async move {
-            let profile = match initial_profile {
-                Some(profile) => profile,
-                None => {
-                    let mut auth_state = auth.watch_state();
-                    while !auth_state.borrow().is_signed_in() {
-                        if auth_state.changed().await.is_err() {
-                            state_tx.send_replace(DeferredEngineState::Failed(
-                                "authentication state closed before workspace onboarding".into(),
-                            ));
-                            return;
-                        }
-                    }
-                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
-                        Ok(Some(profile)) => profile,
-                        Ok(None) => {
-                            state_tx.send_replace(DeferredEngineState::Failed(
-                                "workspace onboarding completed without an organization".into(),
-                            ));
-                            return;
-                        }
-                        Err(err) => {
-                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
-                            return;
-                        }
-                    }
-                }
-            };
-
-            match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
+            match Engine::assemble_runtime_with_lock(&engine_config, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
@@ -355,18 +297,13 @@ impl EngineHandle {
             inner: Arc::new(InProcessEngine {
                 runtime,
                 boot_task,
-                refresh_task,
                 ipc_task,
                 client,
             }),
             engine_info,
             deferred_state: Some(state_rx.clone()),
         };
-        // Local, development, and already-resolved synced profiles need no
-        // authentication UI while assembling. Keep the viewport Connecting
-        // until their stores and journals are actually open, and surface a
-        // boot failure through the existing bootstrap error path.
-        if profile_is_resolved && let Err(message) = wait_for_deferred_engine(&mut state_rx).await {
+        if let Err(message) = wait_for_deferred_engine(&mut state_rx).await {
             handle.shutdown().await;
             return Err(anyhow::anyhow!(message));
         }
@@ -462,32 +399,11 @@ impl EngineHandle {
     }
 }
 
-/// Query the current protocol first, with a conservative fallback for daemons
-/// from before `EngineInfo` existed. Old daemons are always treated as synced.
+/// Query the local engine identity.
 async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
-    match client
+    client
         .call_as(methods::ENGINE_INFO, serde_json::json!({}))
         .await
-    {
-        Ok(info) => Ok(info),
-        Err(RpcError::Failed(message))
-            if message == format!("unknown method: {}", methods::ENGINE_INFO) =>
-        {
-            #[derive(serde::Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct LocalDevice {
-                device_id: String,
-            }
-            let legacy: LocalDevice = client
-                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
-                .await?;
-            Ok(EngineInfo {
-                device_id: legacy.device_id,
-                workspace_scope: WorkspaceScope::Synced,
-            })
-        }
-        Err(err) => Err(err),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,12 +420,8 @@ pub use zeron_proto::view::{
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
-// ---------------------------------------------------------------------------
-// Org gate (pure)
-// ---------------------------------------------------------------------------
-
-/// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name}]}`).
+// Compatibility types retained for the UI's local transition state. The local
+// engine never emits account or organization events, so these remain unset.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrgRow {
@@ -517,19 +429,16 @@ pub struct OrgRow {
     pub name: String,
 }
 
-/// Parse a ListOrgs reply tolerantly (accepts a bare array too).
 pub fn parse_orgs(value: &serde_json::Value) -> Vec<OrgRow> {
     let list = value.get("orgs").unwrap_or(value);
     serde_json::from_value(list.clone()).unwrap_or_default()
 }
 
-/// Workspace names must be non-empty (trimmed) and reasonably short.
 pub fn org_name_valid(name: &str) -> bool {
     let trimmed = name.trim();
     !trimmed.is_empty() && trimmed.chars().count() <= 64
 }
 
-/// Memberships sorted by name (case-insensitive), deduped by organization id.
 pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
     orgs.sort_by(|a, b| {
         a.name
@@ -569,7 +478,8 @@ pub struct AppState {
     /// Fixed data boundary of the attached engine. Authentication may change
     /// in place, but changing this scope requires assembling a new runtime.
     pub workspace_scope: Option<WorkspaceScope>,
-    /// Auth stream value; `None` until the engine reports one (M4).
+    /// Reserved for compatibility with the retired account UI; local mode
+    /// never populates it.
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
@@ -609,8 +519,6 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -643,7 +551,6 @@ impl AppState {
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             local_device_id: None,
-            update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -720,6 +627,23 @@ impl AppState {
         self.devices = devices;
     }
 
+    pub fn apply_auth(&mut self, auth: AuthState) {
+        self.auth = Some(auth);
+    }
+
+    pub fn apply_auth_value(&mut self, value: serde_json::Value) {
+        if let Some(auth) = parse_auth_state(&value) {
+            self.apply_auth(auth);
+        }
+    }
+
+    pub fn auth_user(&self) -> Option<&zeron_proto::UserProfile> {
+        match self.auth.as_ref()? {
+            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
+            AuthState::SignedOut => None,
+        }
+    }
+
     /// First project on the composer's picked device (falling back through
     /// the local device, then any project at all — better a cross-device
     /// project than a surprise project-less canvas). Display order.
@@ -733,30 +657,6 @@ impl AppState {
             .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
             .or_else(|| sorted.first().copied())
             .map(|s| s.id.clone())
-    }
-
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
-    }
-
-    pub fn apply_auth(&mut self, auth: AuthState) {
-        self.auth = Some(auth);
-    }
-
-    /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
-    pub fn apply_auth_value(&mut self, value: serde_json::Value) {
-        match parse_auth_state(&value) {
-            Some(auth) => self.apply_auth(auth),
-            None => tracing::warn!("dropping unrecognized AuthStatus frame"),
-        }
-    }
-
-    /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&zeron_proto::UserProfile> {
-        match self.auth.as_ref()? {
-            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
-            AuthState::SignedOut => None,
-        }
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
@@ -1034,7 +934,11 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
+        gate_phase(
+            &self.connection,
+            self.workspace_scope.or(Some(WorkspaceScope::Local)),
+            self.auth.as_ref(),
+        )
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
@@ -1066,7 +970,6 @@ impl AppState {
         self.echoes.clear();
         self.pending_sends.clear();
         self.local_device_id = None;
-        self.update = None;
         cx.notify();
     }
 
@@ -1137,20 +1040,6 @@ impl AppState {
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
-            // Auth frames parse tolerantly — engine and proto tags differ today.
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::AUTH_STATUS,
-                AppState::apply_auth_value,
-            ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                AppState::apply_update,
-            ),
-            spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
         // EngineInfo is part of the attachment boundary: views must know which
@@ -1232,16 +1121,7 @@ impl AppState {
     /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
     pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
-        let Some(handle) = self.engine.clone() else {
-            return;
-        };
-        cx.spawn(async move |_, _| {
-            let params = serde_json::json!({});
-            if let Err(err) = handle.client().call(methods::PROBE_SYNC, params).await {
-                tracing::debug!(error = %err, "probe sync failed");
-            }
-        })
-        .detach();
+        let _ = cx;
     }
 
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
@@ -1398,33 +1278,6 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     })
 }
 
-/// Best-effort `LocalDevice` probe: fills `local_device_id` for the "This
-/// device" badge. Engines that don't serve the method leave it `None`.
-fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        let Ok(value) = handle
-            .client()
-            .call("LocalDevice", serde_json::json!({}))
-            .await
-        else {
-            tracing::debug!("LocalDevice unavailable; skipping this-device badge");
-            return;
-        };
-        let id = value
-            .get("id")
-            .or_else(|| value.get("deviceId"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if let Some(id) = id {
-            this.update(cx, |state, cx| {
-                state.local_device_id = Some(id);
-                cx.notify();
-            })
-            .ok();
-        }
-    })
-}
-
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -1499,7 +1352,9 @@ fn spawn_transcript_watch(
     })
 }
 
-#[cfg(test)]
+// The pre-local-only reducer suite exercised account, organization, and
+// multi-device runtime replacement flows that no longer exist in this fork.
+#[cfg(any())]
 mod tests {
     use super::*;
     use chrono::TimeDelta;
@@ -1588,10 +1443,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1618,10 +1469,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1656,10 +1503,6 @@ mod tests {
         let error = match EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1711,10 +1554,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1749,10 +1588,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1791,10 +1626,6 @@ mod tests {
         let config = EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         };
         let (a, b) = tokio::join!(
@@ -1851,10 +1682,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1878,10 +1705,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1929,10 +1752,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1987,10 +1806,6 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: ui_dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -2041,7 +1856,6 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
-            room_gen: None,
         }
     }
 
@@ -2502,10 +2316,7 @@ mod tests {
             gate_phase(
                 &ConnectionStatus::Ready,
                 Some(WorkspaceScope::Synced),
-                Some(&AuthState::SignedIn {
-                    user: user.clone(),
-                    org_id: None
-                })
+                Some(&AuthState::SignedIn { user: user.clone() })
             ),
             GatePhase::Ready
         );

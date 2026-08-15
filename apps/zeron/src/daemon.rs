@@ -2,10 +2,7 @@
 //! a systemd **user** unit on Linux (the VPS deployment target), a launchd
 //! LaunchAgent on macOS. The unit runs the current executable with the
 //! `ZERON_*` environment captured at install time, so
-//! `ZERON_EDGE_URL=… zeron daemon install` bakes that override in.
-//!
-//! Auth is decoupled: without a saved session the service remains up on the
-//! local-only profile. `zeron login` and a service restart opt into sync.
+//! the relevant `ZERON_*` environment captured at install time.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,8 +10,6 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 const LAUNCHD_LABEL: &str = "sh.zeron.app";
-/// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
-/// `zeron daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "zeron.service";
 
 /// Environment captured into the unit file. `PATH` is always included (the
@@ -23,13 +18,7 @@ const SYSTEMD_UNIT: &str = "zeron.service";
 const CAPTURED_ENV: &[&str] = &[
     "PATH",
     "ZERON_DATA_DIR",
-    "ZERON_EDGE_URL",
-    "ZERON_EDGE_TOKEN",
-    "ZERON_ORG_ID",
-    "ZERON_WORKOS_CLIENT_ID",
-    "ZERON_WORKOS_API_BASE",
     "ZERON_IPC_PORT",
-    "ZERON_CALLBACK_PORT",
     "ZERON_HARNESS",
     "ZERON_DEVICE_NAME",
     "RUST_LOG",
@@ -69,9 +58,6 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else {
         bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
-    println!(
-        "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
-    );
     println!(
         "Logs: {}",
         if cfg!(target_os = "macos") {
@@ -383,13 +369,13 @@ mod tests {
             Path::new("/usr/local/bin/zeron"),
             &[
                 ("PATH".into(), "/usr/bin:/bin".into()),
-                ("ZERON_EDGE_URL".into(), "https://edge.example".into()),
+                ("ZERON_IPC_PORT".into(), "27654".into()),
                 ("RUST_LOG".into(), "info,zeron=\"debug\"".into()),
             ],
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/zeron headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
-        assert!(unit.contains("Environment=\"ZERON_EDGE_URL=https://edge.example\"\n"));
+        assert!(unit.contains("Environment=\"ZERON_IPC_PORT=27654\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,zeron=\\\"debug\\\"\"\n"));
         assert!(unit.contains("StartLimitIntervalSec=60\n"));
@@ -399,16 +385,6 @@ mod tests {
         assert!(!unit.contains("ConditionPathExists"));
         assert!(unit.contains("EnvironmentFile=-%h/.zeron/env"));
         assert!(unit.contains("WantedBy=default.target"));
-    }
-
-    #[test]
-    fn curl_installer_always_starts_the_local_capable_service() {
-        let installer = include_str!("../../../edge/src/install.sh");
-        assert!(!installer.contains("session.json"));
-        assert!(installer.contains("StartLimitIntervalSec=60\n"));
-        assert!(installer.contains("StartLimitBurst=5\n"));
-        assert!(installer.contains("systemctl --user enable zeron"));
-        assert!(installer.contains("systemctl --user restart zeron"));
     }
 
     #[test]
@@ -436,13 +412,13 @@ mod tests {
     fn launchd_plist_shape() {
         let plist = render_launchd_plist(
             Path::new("/Users/x/zeron & co/zeron"),
-            &[("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into())],
+            &[("ZERON_IPC_PORT".into(), "27654".into())],
             Path::new("/Users/x/.zeron/daemon.log"),
         );
         assert!(plist.contains("<key>Label</key><string>sh.zeron.app</string>"));
         // XML-escaped exe path and env value.
         assert!(plist.contains("<string>/Users/x/zeron &amp; co/zeron</string>"));
-        assert!(plist.contains("<string>https://e?a=1&amp;b=2</string>"));
+        assert!(plist.contains("<string>27654</string>"));
         assert!(plist.contains("<string>headless</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
         assert!(

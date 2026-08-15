@@ -1,14 +1,12 @@
-//! Uploads — attachment staging on the chat's host device
-//! (feature-inventory §3.7 "Uploads"; port of zeron's `uploads.ts`).
+//! Uploads — local attachment staging for chat prompts and transcripts.
 //!
-//! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{uploads_root}/tmp/
-//! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike zeron's
+//! The UI streams a file as base64 chunks (~60KB); chunks stage on disk under
+//! `{uploads_root}/tmp/{uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike
 //! in-memory buffers), and `commit` assembles them into
 //! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
-//! Attachments live only on the host device — every read proxies through the
-//! owning device via `ReadAttachmentChunk`; nothing is mirrored to the edge.
+//! Attachments live only in the local uploads root and are read through
+//! `ReadAttachmentChunk`.
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
 //! only files under the uploads dir or a workspace-known chat cwd are readable
@@ -94,7 +92,7 @@ impl Uploads {
 
     /// Accept `root` for reads from now on (idempotent). Profile import calls
     /// this so transcripts that embed absolute paths under the local profile's
-    /// uploads root keep resolving after the switch to a synced profile.
+    /// uploads root keep resolving after a process restart.
     pub fn add_read_only_root(&self, root: &Path) {
         let mut roots = self
             .inner

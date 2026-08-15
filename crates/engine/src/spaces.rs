@@ -1,7 +1,7 @@
 //! SpacesSync — owner-side upkeep of space rows (git presence) plus the
 //! orphan-chat repair sweep.
 //!
-//! A space is a synced (device, folder) pair; the folder need NOT be a git
+//! A space is a local (device, folder) pair; the folder need NOT be a git
 //! repo. This service watches the workspace `spaces` rows owned by THIS device
 //! and keeps their `gitDetected`/`checkoutId` stamps truthful:
 //!
@@ -11,8 +11,8 @@
 //! - a slow 2-minute repair tick (native watchers coalesce/drop events).
 //!
 //! Stamps are written ONLY on change, so steady state never grows the oplog.
-//! Remote devices read `space.git_detected` straight from the doc — branch
-//! pickers and the diff sidebar gate on it with zero RPCs.
+//! The UI reads `space.git_detected` straight from the local doc — branch
+//! pickers and the diff sidebar gate on it with zero extra RPCs.
 //!
 //! The repair tick also runs the orphan sweep: a chat created concurrently
 //! with a `deleteSpace` on another device can sync in after the cascade ran,

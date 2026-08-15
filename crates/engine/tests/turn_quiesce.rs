@@ -186,7 +186,7 @@ fn assemble(main_prompt: &str) -> Rig {
         feed: Mutex::new(Some(rx)),
     }));
     let dir = tempfile::tempdir().unwrap();
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock)
         .expect("engine core assembles");
     Rig {
         core,

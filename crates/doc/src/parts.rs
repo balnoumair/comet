@@ -1,7 +1,6 @@
 //! Message parts: the event fold, the render-only privacy policy, and continuation splitting.
 //!
-//! Ports of `packages/control/src/parts.ts` (fold) and
-//! `packages/session-doc/src/{render-parts,messages}.ts`.
+//! The fold and render helpers share the local session document schema.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,17 +8,14 @@ use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
-/// Char cap for the tool-output SUMMARY persisted into the doc: first
+/// Char cap for the tool-output summary persisted into the local document:
 /// non-empty line, nothing more. The per-part 4KB cap (c951c3e) bounded each
-/// part but not the session — chat 1b65e93d measured 917KB (85%) of a 1MB doc
-/// in capped outputs across 426 tool parts (docs/chat2-sync.md). Full outputs
-/// live in the R2 sidecar behind `output_ref`; t3code ships an 84-char
-/// summary, so 160 is generous.
+/// Full output remains in the local run journal when the bounded preview is
+/// not enough.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// The doc-resident form of a tool output (docs/chat2-sync.md A1; the R2
-/// sidecar is PARKED as of 2026-08-10, so this IS the whole record in the
-/// doc — the full text survives only in the host's local run journal):
+/// The doc-resident form of a tool output. The full text survives in the
+/// host's local run journal when the bounded preview is not enough:
 ///
 /// - Markdown code fences are stripped first — ACP harnesses fence every
 ///   output, so the fence is transport wrapping, never content (pre-fix,
@@ -65,10 +61,7 @@ pub fn summarize_tool_output(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Per-file diff stats persisted in place of inline diff text (t3's shape).
-/// The inline diff was the bigger bomb than outputs — 32KB/edit, unexercised
-/// only because the claude harness emits none. Full diff text lives in the
-/// sidecar behind `diff_ref`.
+/// Per-file diff stats persisted alongside bounded inline diff text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDiffStat {
@@ -132,19 +125,16 @@ pub enum MessagePart {
         /// render this field either way, so the strip is invisible to them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
-        /// Inline file diff — written by pre-strip app versions only; new
-        /// folds persist [`Self::Tool::diff_stats`] + `diff_ref` instead.
-        /// Kept so old docs render their diffs.
+        /// Inline file diff, retained for readable local snapshots.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
-        /// Sidecar key (`{chatId}/{partId}`) of the full output — additive;
-        /// stamped by [`apply_sidecar_refs`] (the fold is chat-agnostic).
+        /// Legacy local snapshot key for a full output, if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_ref: Option<String>,
         /// Full-output byte length, so the UI can say "Show full output (12 KB)".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_bytes: Option<u64>,
-        /// Sidecar key (`{chatId}/{partId}.diff`) of the full diff JSON.
+        /// Legacy local snapshot key for a full diff JSON, if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_ref: Option<String>,
         /// Per-file diff stats (additive replacement for inline `diff`).
@@ -278,10 +268,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
+                    // Tool outputs stay out of the bounded transcript row;
+                    // full text lives only in the
                     // host's run journal. Inline diffs die the same way:
                     // stats only, never text. `is_error` still folds so
                     // failed chips read as failed.
@@ -344,12 +332,12 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     }
 }
 
-/// Stamp sidecar keys onto resolved tool parts that have sidecar content.
+/// Stamp stable local keys onto resolved tool parts that have full payloads.
 ///
 /// Separate from the fold because the fold is chat-agnostic and pure; the
 /// caller (who knows the chat id) runs this right after each fold step, before
 /// the parts hit the doc. Idempotent. Key shape `{chatId}/{partId}` (+
-/// `.diff`) matches the edge's `/blob/{chatId}/{partId}` route.
+/// `.diff`) is stable within local snapshots.
 pub fn apply_sidecar_refs(chat_id: &str, parts: &mut [MessagePart]) {
     for part in parts.iter_mut() {
         if let MessagePart::Tool {
@@ -372,9 +360,7 @@ pub fn apply_sidecar_refs(chat_id: &str, parts: &mut [MessagePart]) {
     }
 }
 
-/// What a [`AgentEvent::ToolResult`] owes the sidecar: the full output text
-/// and/or the full diff (as JSON), keyed by part id. `None` when the event
-/// carries nothing worth uploading.
+/// Full local payload associated with a tool result, keyed by part id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidecarPayload {
     pub part_id: String,
@@ -659,7 +645,7 @@ mod tests {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
     }
 
-    // ── A1 strip (docs/chat2-sync.md) ───────────────────────────────────────
+    // ── Bounded tool-output summary ─────────────────────────────────────────
 
     #[test]
     fn summarize_inlines_small_outputs_and_marks_big_cuts() {

@@ -1,54 +1,32 @@
 # Zeron
 
-Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, Pi) locally by default, with optional multi-device sync.
+Run coding agents locally with a desktop UI or a headless daemon. Sessions,
+workspace metadata, transcripts, attachments, terminals, and agent-account
+settings stay on the machine that runs Zeron.
 
-![Zeron driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
-
-Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
-
-## Install and run locally (Linux)
+## Run locally
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
-zeron status
+cargo run -p zeron -- status
+cargo run -p zeron -- daemon start
 ```
 
-The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required.
+The engine stores its data under `~/.zeron` by default and exposes its local
+control plane on localhost. No account, cloud worker, sync service, or network
+connection is required to create or continue sessions.
 
-Day-to-day:
+Useful commands:
 
 ```bash
-zeron status      # local/synced mode and engine status
-zeron update      # update to the latest release
+zeron status
+zeron headless
 zeron daemon start|stop|restart|status
 ```
 
-## Optional multi-device sync
+On macOS, the desktop UI can be built from the workspace with `cargo run -p
+zeron-ui`. The same local engine is used in-process or through the localhost
+daemon.
 
-Sign in only when you want to open your account's synced workspace. Authentication changes the profile selected by the next engine start, so stop the daemon before changing it:
-
-```bash
-zeron daemon stop
-zeron login
-zeron daemon start
-```
-
-You can then start an agent on one synced device and follow or drive it from another. An always-on machine such as a VPS can keep those agents working after you close your laptop.
-
-Signing in does not upload, move, or import existing local sessions. Local sessions and their attachments remain under the local profile and reappear when you return to local-only mode:
-
-```bash
-zeron daemon stop
-zeron logout
-zeron daemon start
-```
-
-`zeron login` and `zeron logout` refuse to modify credentials while an engine owns the data directory. The desktop app follows the same next-restart profile boundary.
-
-On macOS: use the desktop release, or build `zeron` from source and run `zeron daemon install` to install the launchd service.
-
----
-
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/comet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the local runtime layout.
 
 Licensed under the [MIT License](LICENSE).

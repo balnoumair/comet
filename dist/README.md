@@ -25,9 +25,7 @@ scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dm
 
 Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Zeron. CI runs this on tags
-(`.github/workflows/release.yml`). The manual steps it automates, for reference
+dmg. The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
