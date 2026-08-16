@@ -289,12 +289,11 @@ pub struct Theme {
     pub appearance: Appearance,
 
     // ---- paint: neutral surfaces ----
-    /// Main content panel. Dark: the deepest plane (#060606). Light: pure white —
+    /// Main content panel. Dark: the charcoal plane (#0a0a0a). Light: pure white —
     /// long-form content reads best on an unbroken white field.
     pub bg: Hsla,
-    /// Shell / sidebar surface. Dark: one step *up* from `bg`. Light: one step
-    /// *down* (grey) — chrome recedes from the content plane in both, which is
-    /// the direction a naive invert gets backwards.
+    /// Shell / sidebar surface. Dark: one step *down* from `bg`; light: one
+    /// step *down* (grey). The chrome recedes from the content plane in both.
     pub surface: Hsla,
     /// Raised surface: opaque pills and chips that sit proud of the panel.
     /// Dark: lighter than `surface`. Light: white, separated by `border` +
@@ -424,16 +423,11 @@ pub struct Theme {
 
 impl Theme {
     // ---- numbers drive layout (px) ----
-    /// Frost translucency over the blurred window background (macOS vibrancy).
-    /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
-    /// merely transparent window would show raw desktop through the sidebar.
-    /// Darkness matched by eye to a reference Electron app's dark glass. That
-    /// scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
-    /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
-    /// backdrop blur has no material layer, so the scrim runs heavier to land
-    /// on the same perceived tone (see [`Theme::glass`]).
-    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
-    /// Light-mode frost alpha — glass-forward, like dark mode.
+    /// Dark chrome is intentionally opaque: the reference uses a near-black
+    /// sidebar and a charcoal conversation plane, with no desktop bleed.
+    /// Light mode retains its separate frost setting below.
+    pub const GLASS_ALPHA: f32 = 1.0;
+    /// Light-mode frost alpha — kept separate from the opaque dark local shell.
     ///
     /// A light tint controls the blur less than a dark one: the desktop's
     /// colour bleeds through more readily, so light frost runs *heavier* than
@@ -472,20 +466,11 @@ impl Theme {
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
 
-    /// The frost tint painted over the blurred window background (macOS glass).
-    /// Dark: darker than `surface`, matched to the reference vibrancy scrim
-    /// `hsl(0 0% 3%)`. Light: a near-white frost run heavier than dark's — see
-    /// [`Self::GLASS_ALPHA_LIGHT`]. On opaque platforms this IS the surface
-    /// tone (no tint swap).
+    /// The shell surface. Dark mode is an opaque near-black sidebar; light mode
+    /// retains its near-white frost tint when the platform supports it.
     pub fn glass(&self) -> Hsla {
         match self.appearance {
-            Appearance::Dark => {
-                if Self::GLASS_ALPHA < 1.0 {
-                    grey(8).opacity(Self::GLASS_ALPHA)
-                } else {
-                    self.surface
-                }
-            }
+            Appearance::Dark => self.surface,
             Appearance::Light => {
                 if Self::GLASS_ALPHA_LIGHT < 1.0 {
                     // 0xfa, not the surface's 0xf4-ish grey: at 90% coverage
@@ -500,10 +485,7 @@ impl Theme {
     }
 
     /// Whether this appearance paints translucent chrome over the blurred
-    /// desktop. Glass-only recipes — backdrop blurs, translucent popover
-    /// tints, per-glyph edge fades — must gate on this, not on
-    /// [`Self::GLASS_ALPHA`]: that constant is platform-wide, while the frost
-    /// alpha (and with it whether glass is on at all) is per-appearance.
+    /// desktop. Glass-only recipes gate on this value.
     pub fn is_glass(&self) -> bool {
         self.glass().a < 1.0
     }
@@ -576,9 +558,8 @@ impl Theme {
 
     /// How the platform should composite the window behind our paint.
     ///
-    /// Only dark macOS wants the blurred desktop — light chrome is opaque by
-    /// design ([`Self::GLASS_ALPHA_LIGHT`]), so it keeps opaque compositing
-    /// (subpixel-friendly, no vibrancy cost for a blur nothing shows). This is
+    /// Light macOS may use the blurred desktop — dark chrome is opaque by
+    /// design, while light chrome follows [`Self::GLASS_ALPHA_LIGHT`]. This is
     /// a method rather than a constant because it has to be *re-applied* after
     /// every theme swap: gpui's macOS backend tears the `NSVisualEffectView`
     /// out of the hierarchy whenever the value is anything but `Blurred`, and
@@ -593,14 +574,13 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme. The surface tones are sampled straight from the
-    /// reference screenshots of the original app (docs/reference): main panel
-    /// `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme. The surface tones are sampled from the supplied
+    /// reference: main panel `#0a0a0a`, shell/sidebar `#040303`.
     pub fn dark() -> Self {
         Self {
             appearance: Appearance::Dark,
-            bg: grey(6),       // main panel — sampled #060606
-            surface: grey(13), // shell / sidebar — sampled #0d0d0d
+            bg: grey(10),     // main panel — sampled #0a0a0a
+            surface: grey(4), // shell / sidebar — sampled #040303
             surface_raised: neutral(0.235),
             surface_card: grey(0x0e),
             surface_dialog: grey(0x10),
@@ -1199,7 +1179,7 @@ mod tests {
     ///
     /// `text_faint` is held to a lower floor on purpose. It is placeholder and
     /// disabled-control copy only, which WCAG 1.4.3 exempts, and the *existing
-    /// dark palette* already measures ~4.2:1 there (neutral-500 on #060606). The
+    /// dark palette* already measures ~4.2:1 there (neutral-500 on #0a0a0a). The
     /// light tone is matched to that inherited number rather than raised past it,
     /// so the two appearances stay siblings; raising the floor is a palette
     /// decision for both modes at once, not something light mode should do alone.
@@ -1370,13 +1350,13 @@ mod tests {
         }
     }
 
-    /// Surfaces must stay *distinguishable*, but the direction differs: dark
-    /// stacks upward in lightness, light puts the content plane on top and lets
-    /// chrome recede. Asserting separation (not a fixed order) is the point.
+    /// Surfaces must stay *distinguishable*. The reference puts the dark
+    /// sidebar below the conversation plane; light mode keeps chrome below
+    /// content as well.
     #[test]
     fn surfaces_are_separated_in_both_appearances() {
         let d = Theme::dark();
-        assert!(d.bg.l < d.surface.l, "dark: chrome sits above content");
+        assert!(d.surface.l < d.bg.l, "dark: sidebar sits below content");
         assert!(d.surface.l < d.surface_raised.l, "dark: raised is lighter");
 
         let l = Theme::light();
@@ -1550,28 +1530,20 @@ mod tests {
         set_current_appearance(Appearance::Dark);
     }
 
-    /// Both appearances are glass-forward on macOS. Light frost runs heavier
-    /// than dark's (a light tint controls the blur less), and floating cards
-    /// step their tint coverage up in light so menu text stays on a
-    /// known-enough background — assert both relationships so the frost and
-    /// the overlay can't drift apart.
+    /// Dark mode is an opaque two-tone canvas. Light mode may retain its
+    /// platform frost, with heavier overlay coverage for readable menus.
     #[test]
-    fn both_appearances_stay_frosted_and_light_runs_heavier() {
-        if Theme::GLASS_ALPHA < 1.0 {
-            let (dark, light) = (Theme::dark(), Theme::light());
-            assert!(dark.glass().a < 1.0, "dark keeps its translucent frost");
-            assert!(light.glass().a < 1.0, "light is glass-forward like dark");
-            assert!(
-                light.glass().a > dark.glass().a - f32::EPSILON,
-                "a light tint dominates the blur less, so it must not run looser than dark"
-            );
+    fn dark_is_opaque_and_light_keeps_its_appearance_contract() {
+        let (dark, light) = (Theme::dark(), Theme::light());
+        assert_eq!(dark.glass().a, 1.0, "dark surfaces are opaque");
+        if Theme::GLASS_ALPHA_LIGHT < 1.0 {
+            assert!(light.glass().a < 1.0, "light keeps its translucent frost");
             assert!(
                 light.glass_overlay().a > dark.glass_overlay().a,
                 "light floating cards need more coverage over blur for legible rows"
             );
         } else {
-            assert_eq!(Theme::light().glass().a, 1.0);
-            assert_eq!(Theme::dark().glass().a, 1.0);
+            assert_eq!(light.glass().a, 1.0);
         }
     }
 

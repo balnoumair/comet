@@ -4,18 +4,17 @@
 //!
 //! 1. A turn completes (Done) → the session parks Idle.
 //! 2. The agent re-invokes ITSELF on a background-task notification and
-//!    streams real output with no prompt behind it. The old parked gate
-//!    dropped that output on the floor ("Build finished successfully…"
-//!    existed in the agent's session data, was absent from zeron's doc).
+//!    streams late output with no prompt behind it. Treating that output as a
+//!    new turn re-armed Working without a matching Done.
 //! 3. A steer ("what about now") becomes the next turn — the agent answers,
 //!    and the turn-end reply is LOST upstream. No Done ever arrives; the
 //!    session read Working forever (the live heartbeat defeats the 45s
 //!    staleness gate by design, and there is no per-turn timeout).
 //!
-//! The fixes under test: parked sessions RESUME on self-continued output
-//! (fold it, show Working), and the quiesce watchdog settles any turn whose
-//! stream goes silent after completed output with nothing in flight —
-//! without ending the run, so a false trip costs a status dip, not content.
+//! The fixes under test: completion is terminal while parked, only an
+//! explicit Steered boundary starts a new turn, and the quiesce watchdog
+//! settles any turn whose stream goes silent after completed output with
+//! nothing in flight.
 
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -87,7 +86,7 @@ fn text(t: &str) -> AgentEvent {
 }
 
 /// Feed-by-hand harness: the test pushes events through a channel, so it can
-/// model turn boundaries, self-continuation, and a LOST turn-end exactly.
+/// model turn boundaries, late adapter output, and a LOST turn-end exactly.
 /// Accepted steers are confirmed with a `Steered` boundary, like the ACP
 /// adapters do. The feed is served only to the test's own dispatch (matched
 /// by prompt) — the engine's auto-titler also runs this harness, and gets an
@@ -242,13 +241,12 @@ where
     }
 }
 
-/// Steps 1+2 of the incident: a completed turn parks the session; the agent
-/// then self-continues (background-task re-invocation) with no prompt. The
-/// output must land in the transcript (it used to be dropped), the session
-/// must read Working while it streams, and — with no Done ever coming for a
-/// self-started turn — the watchdog must settle it back to Idle.
+/// Steps 1+2 of the incident: a completed turn parks the session; late output
+/// from a background-task re-invocation must not reopen it. Completion stays
+/// terminal until an explicit steer boundary arrives, and the late output is
+/// treated as post-turn noise rather than a new transcript segment.
 #[tokio::test]
-async fn parked_self_continuation_folds_and_requiesces() {
+async fn parked_late_output_does_not_reopen_working() {
     let rig = assemble("pull waku and benchmark it");
     rig.core
         .sessions
@@ -271,34 +269,24 @@ async fn parked_self_continuation_folds_and_requiesces() {
     )
     .await;
 
-    // Self-continuation: streamed output with NO turn behind it, arriving
-    // well past the resume gate (a real one follows a whole agent round
-    // trip — the incident's came five minutes after the park).
+    // Late output with NO turn behind it, arriving well after the completion
+    // boundary, must remain parked instead of creating a phantom turn.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(text("Build finished successfully. Launching Waku."))
         .unwrap();
-    wait_for(
-        || status(&rig.core) == Some(SessionStatus::Working),
-        "parked session resumes Working on self-continued output",
-    )
-    .await;
-
-    // No Done will ever come for a self-started turn: the watchdog parks it.
-    wait_for(
-        || status(&rig.core) == Some(SessionStatus::Idle),
-        "watchdog re-parks the self-continued turn",
-    )
-    .await;
-
-    // The self-continued output is in the doc as its own COMPLETE entry —
-    // this exact text was lost in the incident.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        status(&rig.core),
+        Some(SessionStatus::Idle),
+        "late output must not reopen a completed persistent turn"
+    );
     let texts = assistant_texts(&rig.core);
     assert!(
-        texts.iter().any(|(t, s)| {
-            t.contains("Build finished successfully") && *s == Some(MessageStatus::Complete)
-        }),
-        "self-continued output must fold into a complete transcript entry, got {texts:#?}"
+        !texts
+            .iter()
+            .any(|(t, _)| t.contains("Build finished successfully")),
+        "late post-turn output must not create a transcript entry, got {texts:#?}"
     );
 
     rig.core.sessions.shutdown().await;
@@ -466,9 +454,8 @@ async fn stale_tool_echo_stays_parked() {
     )
     .await;
 
-    // A late tool_call_update re-emitted as a full ToolCall for the OLD id —
-    // sent past the resume gate, so it is the seen-tools guard (not the
-    // gate) keeping the session parked.
+    // A late tool_call_update re-emitted as a full ToolCall for the OLD id
+    // must remain parked along with every other post-turn event.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(AgentEvent::ToolCall {

@@ -5,7 +5,7 @@ use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
-use zeron_proto::Chat;
+use zeron_proto::{Chat, Space};
 use zeron_rpc::methods;
 
 use crate::state::AppState;
@@ -14,6 +14,50 @@ use crate::theme::Theme;
 /// Archived rows in sidebar (recency) order. Pure.
 pub fn archived_chats(chats: &[Chat]) -> Vec<&Chat> {
     chats.iter().filter(|c| c.archived).collect()
+}
+
+struct ArchivedProjectGroup {
+    key: String,
+    name: String,
+    chats: Vec<Chat>,
+}
+
+/// Groups archived threads by their owning project while keeping each
+/// project's session order intact. A missing space remains visible under a
+/// truthful fallback heading instead of disappearing from history.
+fn archived_project_groups(chats: &[Chat], spaces: &[Space]) -> Vec<ArchivedProjectGroup> {
+    let mut groups: Vec<ArchivedProjectGroup> = Vec::new();
+    for chat in archived_chats(chats).into_iter().cloned() {
+        let space = chat
+            .space_id
+            .as_deref()
+            .and_then(|id| spaces.iter().find(|space| space.id == id));
+        let (key, name) = match space {
+            Some(space) => (space.id.clone(), space.display_name().to_string()),
+            None if chat.space_id.is_some() => (
+                chat.space_id.clone().unwrap_or_default(),
+                "Unknown project".to_string(),
+            ),
+            None => ("__no-project__".to_string(), "No project".to_string()),
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.chats.push(chat);
+        } else {
+            groups.push(ArchivedProjectGroup {
+                key,
+                name,
+                chats: vec![chat],
+            });
+        }
+    }
+    groups.sort_by(|a, b| {
+        (a.name == "No project", a.name.to_lowercase(), a.key.clone()).cmp(&(
+            b.name == "No project",
+            b.name.to_lowercase(),
+            b.key.clone(),
+        ))
+    });
+    groups
 }
 
 pub struct ArchivedPage {
@@ -71,172 +115,153 @@ impl Render for ArchivedPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
-        let now = chrono::Utc::now();
-        let (rows, device_names): (Vec<Chat>, std::collections::HashMap<String, String>) = {
+        let groups: Vec<ArchivedProjectGroup> = {
             let state = self.state.read(cx);
-            let rows = archived_chats(&state.chats).into_iter().cloned().collect();
-            let names = state
-                .devices
-                .iter()
-                .map(|d| (d.id.clone(), d.name.clone()))
-                .collect();
-            (rows, names)
+            archived_project_groups(&state.chats, &state.spaces)
         };
         let busy = self.busy.clone();
-        let count = rows.len();
+        let count: usize = groups.iter().map(|group| group.chats.len()).sum();
+        let mut row_index = 0usize;
+        let mut items: Vec<AnyElement> = Vec::new();
 
-        let items: Vec<AnyElement> = rows
-            .into_iter()
-            .enumerate()
-            .map(|(ix, chat)| {
-                let title: SharedString = chat
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Untitled session".into())
-                    .into();
-                // Unknown device → no fragment at all (zeron renders the
-                // device span only when the name resolves).
-                let device: Option<SharedString> =
-                    device_names.get(&chat.device_id).cloned().map(Into::into);
-                let time_ago: SharedString = crate::state::format_time_ago(
-                    chat.last_message_at.unwrap_or(chat.created_at),
-                    now,
-                )
-                .into();
-                let location: Option<SharedString> =
-                    crate::state::chat_location(&chat).map(Into::into);
-                let is_busy = busy.as_deref() == Some(chat.id.as_str());
-                let row_hovered = self.hovered == Some(ix);
-                let chat_id = chat.id.clone();
-                // zeron settings.archived.tsx row: archive tile, medium title
-                // + tabular time, quiet device · location meta, Unarchive.
+        for (group_ix, group) in groups.into_iter().enumerate() {
+            let group_key = group.key.clone();
+            let group_name: SharedString = group.name.into();
+            let group_count = group.chats.len();
+            items.push(
                 div()
-                    .id(("archived-row", ix))
+                    .id(SharedString::from(format!("archived-project-{group_key}")))
+                    .mt(px(if group_ix == 0 { 0.0 } else { 18.0 }))
+                    .h(px(30.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(12.0))
-                    .rounded(px(8.0))
+                    .gap(px(8.0))
                     .px(px(12.0))
-                    .py(px(8.0))
-                    .hover(|s| s.bg(crate::theme::ink(0.03)))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered {
-                            this.hovered = Some(ix);
-                        } else if this.hovered == Some(ix) {
-                            this.hovered = None;
-                        }
-                        cx.notify();
-                    }))
                     .child(
-                        div()
-                            .flex_none()
-                            .size(px(32.0))
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted.opacity(0.6)),
-                            ),
+                        crate::icons::icon(crate::icons::FOLDER)
+                            .size(px(18.0))
+                            .text_color(theme.text_muted.opacity(0.75)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(13.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(px(11.0))
-                                            .text_color(theme.text_muted.opacity(0.5))
-                                            .child(time_ago),
-                                    ),
-                            )
-                            .child({
-                                // device · location, separator at the line's
-                                // own tone (zeron: a plain span inheriting
-                                // `text-muted-foreground/55`).
-                                let mut meta = div()
-                                    .mt(px(2.0))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.55));
-                                let both = device.is_some() && location.is_some();
-                                if let Some(device) = device {
-                                    meta = meta.child(device);
-                                }
-                                if both {
-                                    meta = meta.child(SharedString::from("·"));
-                                }
-                                if let Some(location) = location {
-                                    meta = meta.child(div().min_w_0().truncate().child(location));
-                                }
-                                meta
-                            }),
+                            .truncate()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(group_name),
                     )
                     .child(
-                        // Hidden until the row is hovered (zeron `opacity-0
-                        // group-hover:opacity-100`); hover fill is the solid
-                        // accent tone (`hover:bg-accent`).
                         div()
-                            .id(("unarchive", ix))
                             .flex_none()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .px(px(10.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .opacity(if row_hovered || is_busy { 1.0 } else { 0.0 })
-                            .when(is_busy, |el| el.opacity(0.4))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.surface_raised).text_color(theme.text))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.unarchive(chat_id.clone(), cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from(if is_busy {
-                                "Unarchiving…"
-                            } else {
-                                "Unarchive"
-                            })),
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.55))
+                            .child(SharedString::from(format!("{group_count}"))),
                     )
-                    .into_any_element()
-            })
-            .collect();
+                    .into_any_element(),
+            );
+
+            for chat in group.chats {
+                let ix = row_index;
+                row_index += 1;
+                let title: SharedString = chat
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Untitled session".into())
+                    .into();
+                let is_busy = busy.as_deref() == Some(chat.id.as_str());
+                let row_hovered = self.hovered == Some(ix);
+                let chat_id = chat.id.clone();
+                // Archived rows stay intentionally minimal: project grouping
+                // provides the context, while each row shows only its title.
+                items.push(
+                    div()
+                        .id(("archived-row", ix))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(12.0))
+                        .rounded(px(8.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .hover(|s| s.bg(crate::theme::ink(0.03)))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.hovered = Some(ix);
+                            } else if this.hovered == Some(ix) {
+                                this.hovered = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(32.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted.opacity(0.6)),
+                                ),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().flex().flex_col().child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(title),
+                            ),
+                        )
+                        .child(
+                            // Hidden until the row is hovered (zeron `opacity-0
+                            // group-hover:opacity-100`); hover fill is the solid
+                            // accent tone (`hover:bg-accent`).
+                            div()
+                                .id(("unarchive", ix))
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .opacity(if row_hovered || is_busy { 1.0 } else { 0.0 })
+                                .when(is_busy, |el| el.opacity(0.4))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.surface_raised).text_color(theme.text))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unarchive(chat_id.clone(), cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from(if is_busy {
+                                    "Unarchiving…"
+                                } else {
+                                    "Unarchive"
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
 
         let body: AnyElement = if items.is_empty() {
             // Centered empty state (zeron settings.archived.tsx).
@@ -266,7 +291,7 @@ impl Render for ArchivedPage {
                         .text_size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.4))
                         .child(SharedString::from(
-                            "Right-click a session in the sidebar to archive it.",
+                            "Archived threads are grouped here by project.",
                         )),
                 )
                 .into_any_element()
@@ -336,11 +361,67 @@ mod tests {
         }
     }
 
+    fn chat_in_space(id: &str, archived: bool, space_id: Option<&str>) -> Chat {
+        let mut chat = chat(id, archived);
+        chat.space_id = space_id.map(str::to_owned);
+        chat
+    }
+
+    fn space(id: &str, name: &str) -> Space {
+        Space {
+            id: id.into(),
+            device_id: "d".into(),
+            path: format!("/tmp/{name}"),
+            name: Some(name.into()),
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn only_archived_rows_show() {
         let chats = vec![chat("a", false), chat("b", true), chat("c", true)];
         let rows = archived_chats(&chats);
         let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["b", "c"]);
+    }
+
+    #[test]
+    fn archived_rows_group_by_project() {
+        let chats = vec![
+            chat_in_space("beta-thread", true, Some("s2")),
+            chat_in_space("alpha-first", true, Some("s1")),
+            chat_in_space("active", false, Some("s1")),
+            chat_in_space("no-project", true, None),
+            chat_in_space("alpha-second", true, Some("s1")),
+        ];
+        let spaces = vec![space("s1", "Alpha"), space("s2", "Beta")];
+
+        let groups = archived_project_groups(&chats, &spaces);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta", "No project"]
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.chats.len())
+                .collect::<Vec<_>>(),
+            [2, 1, 1]
+        );
+        assert_eq!(
+            groups[0]
+                .chats
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha-first", "alpha-second"]
+        );
     }
 }
