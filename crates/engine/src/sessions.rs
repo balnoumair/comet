@@ -80,7 +80,6 @@ struct RuntimeConfig {
     cwd: String,
     sandbox: zeron_proto::SandboxLevel,
     auto_approve: bool,
-    worktree: Option<zeron_proto::WorktreeSpec>,
 }
 
 impl RuntimeConfig {
@@ -93,7 +92,6 @@ impl RuntimeConfig {
             cwd: request.cwd.clone(),
             sandbox: request.sandbox,
             auto_approve: request.auto_approve,
-            worktree: request.worktree.clone(),
         }
     }
 
