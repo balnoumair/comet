@@ -384,7 +384,7 @@ const CHAT_ROW_HEIGHT: f32 = 57.0;
 /// separates one project's cluster from the last card of the previous one.
 /// The gap lives INSIDE the header so the resort math, which sums these
 /// heights, does not have to special-case group boundaries.
-const SPACE_HEADER_HEIGHT: f32 = 30.0;
+const SPACE_HEADER_HEIGHT: f32 = 34.0;
 /// Flex gap between sidebar list items. Wide enough that consecutive cards
 /// read as separate projects on a fill-less glass column — the rows carry no
 /// border of their own, so this gap is the separation.
@@ -730,20 +730,17 @@ pub struct Shell {
     /// the transcript's bottom clearance, and the jump pill's anchor (the
     /// same one-frame lag every fade here rides).
     bottom_stack: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
-    /// expanded list ("Show more" reveals another page).
-    pub(super) archived_open: bool,
-    pub(super) archived_shown: usize,
-    /// Archived slim row under the pointer — swaps its time label for the
-    /// Unarchive affordance and restores the dimmed harness mark (t3code's
-    /// settled-row hover).
-    pub(super) archived_hover: Option<String>,
+    /// Whether the Projects shelf header is under the pointer. Its actions
+    /// stay quiet until the shelf is being used, like the reference sidebar.
+    pub(super) projects_header_hovered: bool,
     /// Projects whose session cluster is folded away, by space id (`~` for
-    /// the project-less group). Session-transient like `archived_open`, and
+    /// the project-less group). Session-transient, and
     /// a COLLAPSED set rather than an expanded one so a newly appearing
     /// project is open by default.
     pub(super) collapsed_spaces: std::collections::HashSet<String>,
+    /// The project header currently under the pointer; drives the scoped `+`
+    /// action without adding permanent noise to every project row.
+    pub(super) project_header_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -978,10 +975,9 @@ impl Shell {
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
-            archived_open: true,
-            archived_shown: 0,
-            archived_hover: None,
+            projects_header_hovered: false,
             collapsed_spaces: std::collections::HashSet::new(),
+            project_header_hover: None,
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -2925,8 +2921,8 @@ impl Shell {
 
     /// One session row (zeron session-row.tsx): status rail on the left
     /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
+    /// relative time on the first line, branch metadata underneath aligned to
+    /// the title. Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -3224,11 +3220,6 @@ impl Shell {
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (user, workspace_scope) = {
-            let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
-        };
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -3284,41 +3275,7 @@ impl Shell {
             })
             .collect();
 
-        // t3code's archived accordion, below the active list.
-        let archived_section = self.render_archived_section(theme, cx);
-
-        let (user_line, trigger_subline, menu_identity): (
-            SharedString,
-            Option<SharedString>,
-            SharedString,
-        ) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
-                } else {
-                    "Local only"
-                };
-                (line.into(), None, "Stored on this device".into())
-            }
-            Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
-            ),
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
-                let email = user
-                    .as_ref()
-                    .map(|u| SharedString::from(u.email.clone()))
-                    .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
-            }
-        };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let settings_button = self.render_settings_button(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -3374,8 +3331,7 @@ impl Shell {
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
-                            })
-                            .children(archived_section),
+                            }),
                     ),
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
@@ -3402,32 +3358,22 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .child(settings_button),
+            )
             .into_any_element()
     }
 
-    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
-    /// their storage boundary and offer sync; synced runtimes offer sign-out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        trigger_subline: Option<SharedString>,
-        menu_identity: SharedString,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.user_menu.is_open();
+    /// Direct Settings entry point. Local mode is the only runtime surfaced
+    /// in the sidebar, so there is no account/scope dropdown here.
+    fn render_settings_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
+        let menu_identity = SharedString::from("Settings");
         let mut trigger = div()
-            .id("user-menu")
+            .id("settings-trigger")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
@@ -3437,73 +3383,29 @@ impl Shell {
             .items_center()
             .gap(px(10.0))
             .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover().opacity(0.8),
-                )
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
-            )
+            .bg(motion::hover_blend(
+                "settings-trigger",
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover().opacity(0.8),
+            ))
+            .on_hover(motion::hover_listener("settings-trigger"))
             .on_click(cx.listener(|this, _, _, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
-                if this.user_menu.take_press_was_open() {
-                    this.close_user_menu(cx);
-                } else {
-                    this.user_menu.open(());
-                }
-                cx.notify();
+                this.open_settings(SettingsSection::Devices, cx);
             }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
             )
             .child(
-                // Name with an optional status line underneath — no chip on the right.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .when_some(trigger_subline, |identity, subline| {
-                        identity.child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(15.0))
-                                .text_color(theme.text_muted)
-                                .child(subline),
-                        )
-                    }),
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Settings")),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();

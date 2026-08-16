@@ -269,60 +269,25 @@ impl Shell {
         }
     }
 
-    /// The sidebar's space-filter row: current filter ("All projects" or the
-    /// space's name) + chevron, the dropdown floating beneath while open.
+    /// The sidebar's Projects shelf: a quiet title with hover actions. The
+    /// ellipsis keeps the existing project-filter dropdown, while `+` opens a
+    /// new thread using the current project context.
     /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
     pub(super) fn render_spaces_filter(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let filter = self.settings.space_filter.clone();
-        // Name + the dropdown rows' "@ device" tag on the trigger itself, so
-        // the filtered space's host reads without opening the picker.
-        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
-            let state = self.state.read(cx);
-            match filter.as_deref().and_then(|id| state.space_row(id)) {
-                Some(space) => {
-                    let (tag, offline) = state.space_device_tag(space, Utc::now());
-                    (
-                        space.display_name().to_string().into(),
-                        Some((tag.into(), offline)),
-                    )
-                }
-                None => (SharedString::from("All projects"), None),
-            }
-        };
         let open = self.spaces_menu.is_open();
+        let actions_visible = self.projects_header_hovered || open;
 
-        let trigger = div()
-            .id("spaces-filter")
-            .flex_1()
-            .min_w_0()
-            .h(px(29.0))
+        let menu_trigger = div()
+            .id("projects-menu-trigger")
+            .size(px(26.0))
             .flex()
-            .flex_row()
             .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                "spaces-filter",
-                theme.text.opacity(0.8),
-                theme.text,
-            ))
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "spaces-filter",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover(),
-                )
-            })
-            .on_hover(motion::hover_listener("spaces-filter"))
+            .justify_center()
+            .rounded(px(6.0))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -338,99 +303,74 @@ impl Shell {
                 }
             }))
             .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
+                icon(icons::MORE_HORIZONTAL)
+                    .size(px(18.0))
                     .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            // flex_1 pushes the caret to the trigger's right edge and gives
-            // long space names a bound to truncate against; the "@ device"
-            // tag hugs the name inside it rather than sitting by the caret.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(div().min_w_0().truncate().child(label))
-                    .when_some(device_tag, |el, (tag, offline)| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.0))
-                                .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(theme.text_muted.opacity(0.45))
-                                .child(tag),
-                        )
-                        // Disconnected glyph, not the word (user request).
-                        .when(offline, |el| {
-                            el.child(
-                                icon(icons::WIFI_OFF)
-                                    .size(px(12.0))
-                                    .flex_none()
-                                    .text_color(theme.warning.opacity(0.8)),
-                            )
-                        })
-                    }),
-            )
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.6)),
+                    .text_color(theme.text_muted.opacity(0.85)),
             );
-        let trigger = if self.spaces_menu.get().is_some() {
+        let menu_trigger = if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
-            trigger.relative().child(popover::anchored_menu_below(
+            menu_trigger.relative().child(popover::anchored_menu_below(
                 "spaces-filter-menu",
                 menu,
                 closing,
             ))
         } else {
-            trigger
+            menu_trigger
         };
 
-        // NEW SESSION beside the trigger (adding a project lives in the
-        // dropdown's "New project…" row now). While the sidebar is collapsed
-        // this same button fades into the titlebar instead
-        // (`render_session_title_bar`). A plain button — the canvas showing
-        // is not an "active" state worth a selected wash (user feedback).
         let add = div()
             .id("sidebar-new-session")
-            .size(px(24.0))
+            .size(px(26.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(motion::hover_blend(
-                "sidebar-new-session",
-                crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
-            ))
-            .on_hover(motion::hover_listener("sidebar-new-session"))
+            .hover(|s| s.bg(crate::theme::wash(0.14)))
             .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx)))
             .child(
                 icon(icons::PLUS)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .size(px(18.0))
+                    .text_color(theme.text_muted.opacity(0.85)),
             );
 
         div()
+            .id("projects-header")
             .flex_none()
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
-            .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
-            .child(trigger)
-            .child(add)
+            .h(px(48.0))
+            .px(px(Theme::SPACE_MD))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.projects_header_hovered != *hovered {
+                    this.projects_header_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(17.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text.opacity(0.82))
+                    .child(SharedString::from("Projects")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .when(!actions_visible, |el| el.opacity(0.0))
+                    .child(menu_trigger)
+                    .child(add),
+            )
             .into_any_element()
     }
 
@@ -675,11 +615,10 @@ impl Shell {
         out
     }
 
-    /// A project's title above its cluster of sessions: folder mark + name +
-    /// a fold chevron, with the group's air carried in the header's own
-    /// height so the FLIP resort math (which sums the keyed heights) stays
-    /// exact. The whole strip is the toggle — the chevron is the affordance,
-    /// not a separate hit target (the archived shelf reads the same way).
+    /// A project's title above its cluster of sessions: the folder mark is
+    /// itself the open/closed affordance, with a scoped `+` for a new thread.
+    /// The group's air is carried in the header's own height so the FLIP
+    /// resort math (which sums the keyed heights) stays exact.
     /// Folded groups show their session count, matching "Archived (N)".
     fn render_space_header(
         &self,
@@ -690,44 +629,54 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let hovered = self.project_header_hover.as_deref() == Some(space_key.as_str());
+        let is_project = space_key != "~";
+        let hover_id = space_key.clone();
+        let collapse_id = space_key.clone();
         div()
             .id(SharedString::from(format!("space-header-{space_key}")))
             .h(px(super::SPACE_HEADER_HEIGHT))
             .flex()
             .flex_row()
-            .items_end()
-            .pb(px(4.0))
+            .items_center()
             .px(px(Theme::SPACE_SM))
             .gap(px(Theme::SPACE_XS))
+            .when(hovered, |el| el.bg(theme.glass_hover()))
+            .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                if *entered {
+                    if this.project_header_hover.as_deref() != Some(hover_id.as_str()) {
+                        this.project_header_hover = Some(hover_id.clone());
+                        cx.notify();
+                    }
+                } else if this.project_header_hover.as_deref() == Some(hover_id.as_str()) {
+                    this.project_header_hover = None;
+                    cx.notify();
+                }
+            }))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.collapsed_spaces.remove(&space_key) {
-                    this.collapsed_spaces.insert(space_key.clone());
+                if !this.collapsed_spaces.remove(&collapse_id) {
+                    this.collapsed_spaces.insert(collapse_id.clone());
                 }
                 cx.notify();
             }))
             .child(
                 icon(if collapsed {
-                    icons::ALT_ARROW_RIGHT
+                    icons::FOLDER
                 } else {
-                    icons::ALT_ARROW_DOWN
+                    icons::FOLDER_WITH_FILES
                 })
-                .size(px(11.0))
+                .size(px(20.0))
                 .flex_none()
-                .text_color(theme.text_muted.opacity(0.7)),
-            )
-            .child(
-                icon(icons::FOLDER)
-                    .size(px(11.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
+                .text_color(theme.text_muted),
             )
             .child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
+                    .text_size(px(14.0))
+                    .line_height(px(18.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(name),
@@ -736,257 +685,38 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.0))
-                        .line_height(px(14.0))
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
                         .text_color(theme.text_muted.opacity(0.5))
                         .child(SharedString::from(format!("({count})"))),
                 )
             })
-            .into_any_element()
-    }
-
-    /// The sidebar's archived shelf — a direct port of t3code's settled
-    /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
-    /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
-    /// title, time-ago right — the time yields to Unarchive on row hover),
-    /// and the tail pages behind an explicit "Show N more" row (initial 10,
-    /// +25 a click). `None` when nothing is archived under the current
-    /// project filter.
-    pub(super) fn render_archived_section(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        const INITIAL: usize = 10;
-        const PAGE: usize = 25;
-        let now = Utc::now();
-        let filter = self.settings.space_filter.clone();
-        let rows: Vec<zeron_proto::Chat> = {
-            let state = self.state.read(cx);
-            state
-                .chats
-                .iter()
-                .filter(|c| c.archived)
-                .filter(|chat| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .cloned()
-                .collect()
-        };
-        if rows.is_empty() {
-            return None;
-        }
-        let total = rows.len();
-        let open = self.archived_open;
-        let shown = self.archived_shown.max(INITIAL);
-        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
-        // filling the middle, chevron flipping open/closed. The count only
-        // shows while collapsed — expanded, the rows speak for themselves.
-        let label: SharedString = if open {
-            "Archived".into()
-        } else {
-            format!("Archived ({total})").into()
-        };
-        let header = div()
-            .id("archived-toggle")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .mt(px(12.0))
-            .mb(px(4.0))
-            .px(px(10.0))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.archived_open = !this.archived_open;
-                this.archived_shown = INITIAL;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.5))
-                    .child(label),
-            )
-            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
-            .child(
-                crate::icons::icon(if open {
-                    crate::icons::ALT_ARROW_DOWN
-                } else {
-                    crate::icons::ALT_ARROW_RIGHT
-                })
-                .size(px(12.0))
-                .flex_none()
-                .text_color(theme.text_muted.opacity(0.5)),
-            );
-        let mut section = div().flex().flex_col().child(header);
-        if open {
-            let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
-            let mut list = div().flex().flex_col().gap(px(2.0));
-            for chat in rows.into_iter().take(shown) {
-                let id = chat.id.clone();
-                let hovered = self.archived_hover.as_deref() == Some(id.as_str());
-                let is_selected = selected.as_deref() == Some(id.as_str());
-                let title: SharedString = transcript::single_line(
-                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                )
-                .into();
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let (mark, tint) = chat
-                    .config
-                    .as_ref()
-                    .map(|c| crate::pickers::harness_brand_icon(c.harness))
-                    .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
-                // Right slot: time at rest; the Unarchive affordance takes
-                // its place on row hover (t3code: "only the time/jump label
-                // yields to the settle affordance").
-                let right: AnyElement = if hovered {
-                    let restore_id = id.clone();
-                    // Metrics match the active rows' Archive pill exactly
-                    // (18px pill, 11px icon, 10px label, padding bled right)
-                    // — two sizes of the same affordance read as a mistake.
+            .when(is_project, |el| {
+                let add_space = space_key.clone();
+                el.child(
                     div()
-                        .id(SharedString::from(format!("archived-restore-{id}")))
+                        .id(SharedString::from(format!("space-new-session-{add_space}")))
+                        .size(px(24.0))
+                        .flex_none()
                         .flex()
-                        .flex_row()
                         .items_center()
-                        .gap(px(4.0))
-                        .h(px(18.0))
-                        .px(px(4.0))
-                        .mr(px(-4.0))
-                        .rounded(px(5.0))
-                        .bg(crate::theme::wash(0.10))
-                        .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .when(!hovered, |el| el.opacity(0.0))
+                        .hover(|s| s.bg(crate::theme::wash(0.14)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.set_chat_archived(restore_id.clone(), false, cx);
+                            this.open_new_session_in_space(add_space.clone(), cx);
                         }))
                         .child(
-                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
-                        .child(time_ago)
-                        .into_any_element()
-                };
-                let hover_id = id.clone();
-                let open_id = id.clone();
-                let menu_id = id.clone();
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("archived-{id}")))
-                        .h(px(36.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.0))
-                        .px(px(10.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
-                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
-                            if *entered {
-                                if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
-                                    this.archived_hover = Some(hover_id.clone());
-                                    cx.notify();
-                                }
-                            } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
-                                this.archived_hover = None;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_chat(open_id.clone(), cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                this.chat_menu.open((menu_id.clone(), event.position));
-                                cx.notify();
-                            }),
-                        )
-                        // Archived history recedes: dimmed mark at rest,
-                        // restored on hover (t3code's grayscale favicon).
-                        .child(
-                            crate::icons::icon(mark)
-                                .size(px(14.0))
-                                .flex_none()
-                                .text_color(if hovered || is_selected {
-                                    tint.unwrap_or(theme.text_muted)
-                                } else {
-                                    tint.unwrap_or(theme.text_muted).opacity(0.4)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(13.0))
-                                .text_color(if hovered || is_selected {
-                                    theme.text
-                                } else {
-                                    theme.text.opacity(0.55)
-                                })
-                                .child(title),
-                        )
-                        .child(right),
-                );
-            }
-            // Mount fade: the shelf popping in whole read as jank — a quick
-            // fade on the expanded list softens the accordion.
-            section = section.child(motion::fade_quick("archived-list", list));
-            if total > shown {
-                let remaining = (total - shown).min(PAGE);
-                section = section.child(
-                    div()
-                        .id("archived-more")
-                        // Sits outside the rows' gapped column — match the
-                        // list's 2px row gap or it fuses with the last row.
-                        .mt(px(2.0))
-                        .h(px(36.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.0))
-                        .px(px(10.0))
-                        .rounded(px(6.0))
-                        .text_size(px(13.0))
-                        .text_color(theme.text_muted.opacity(0.55))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
-                            cx.notify();
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::PLUS)
-                                .size(px(14.0))
-                                .flex_none(),
-                        )
-                        .child(SharedString::from(format!("Show {remaining} more"))),
-                );
-            }
-        }
-        Some(section.pb(px(Theme::SPACE_SM)).into_any_element())
+                            icon(icons::PLUS)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted.opacity(0.85)),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     // ---- add-space flow (the ⌘K palette) ----

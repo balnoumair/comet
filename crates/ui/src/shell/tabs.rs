@@ -58,6 +58,17 @@ impl Shell {
         cx.notify();
     }
 
+    /// Start a new thread in a specific project without changing the
+    /// sidebar's current project filter.
+    pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.state.update(cx, |s, cx| {
+            s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
+        });
+        cx.notify();
+    }
+
     /// The unified titlebar in chat mode:
     /// `[fading +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
@@ -66,37 +77,19 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
-        // drag region, and buttons. A session appends its target as a muted
-        // "project @ device" tag right of the title (the composer footer no
-        // longer carries it).
-        let (title, target, harness, on_canvas): (
-            SharedString,
-            Option<SharedString>,
-            Option<zeron_proto::HarnessId>,
-            bool,
-        ) = {
+        // drag region, and buttons. Project/device context is already managed
+        // by the sidebar and Settings, so the thread title stays focused.
+        let (title, harness, on_canvas): (SharedString, Option<zeron_proto::HarnessId>, bool) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
-                Some(chat) => {
-                    let folder = chat
-                        .space_id
-                        .as_deref()
-                        .and_then(|id| state.space_row(id))
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "~".to_string());
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or("Unknown device");
-                    (
-                        SharedString::from(transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )),
-                        Some(SharedString::from(format!("{folder} @ {device}"))),
-                        chat.config.as_ref().map(|c| c.harness),
-                        false,
-                    )
-                }
-                None => (SharedString::from(""), None, None, true),
+                Some(chat) => (
+                    SharedString::from(transcript::single_line(
+                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                    )),
+                    chat.config.as_ref().map(|c| c.harness),
+                    false,
+                ),
+                None => (SharedString::from(""), None, true),
             }
         };
 
@@ -262,16 +255,7 @@ impl Shell {
                                     theme.text.opacity(0.85)
                                 })
                                 .child(title),
-                        )
-                        .when_some(target, |el, target| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child(target),
-                            )
-                        }),
+                        ),
                 )
             })
             .child(div().flex_1())

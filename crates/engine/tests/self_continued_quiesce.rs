@@ -1,16 +1,13 @@
-//! The SHORT quiesce window for self-continued turns (2026-08-13 incident:
-//! "stuck in working after you finished watching the build").
+//! Parked-session completion boundaries (2026-08-13 incident: "stuck in
+//! working after you finished watching the build").
 //!
-//! A turn the agent starts on its own — a background-task wake — can never
-//! receive a harness Done: the adapter has no `session/prompt` outstanding to
-//! settle, so the quiesce watchdog is that turn shape's ONLY settle path.
-//! With the shared 120s window every background notification ended in ~2min
-//! of phantom Working. Self-continued turns now use a much shorter window
-//! (`ZERON_SELF_TURN_QUIESCE_MS`); prompt/steer turns keep the normal one.
+//! A turn the agent starts on its own — a background-task wake — has no
+//! prompt-owned Done to settle it. Its late output must therefore stay parked
+//! rather than re-opening Working without an explicit new steer boundary.
 //!
-//! This file exists separately from `turn_quiesce.rs` because the env knobs
-//! are process-global: here the NORMAL window is set far beyond the test
-//! horizon, so a fast park can only have come through the short path.
+//! This file exists separately from `turn_quiesce.rs` because the env knob is
+//! process-global: here the NORMAL window is set far beyond the test horizon,
+//! so the explicit steer test can verify that a live turn remains Working.
 
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -29,20 +26,15 @@ use zeron_proto::{
 
 const CHAT: &str = "chat-self-quiesce";
 /// Normal window: far beyond the test horizon — any park inside the test
-/// window must have come through the self-continued path.
+/// window is intentionally far beyond the test horizon.
 const QUIESCE_MS: u64 = 600_000;
-/// Short window under test.
-const SELF_QUIESCE_MS: u64 = 400;
 
 fn init_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: called before any engine (and thus any reader of the vars)
         // exists in this test process.
-        unsafe {
-            std::env::set_var("ZERON_TURN_QUIESCE_MS", QUIESCE_MS.to_string());
-            std::env::set_var("ZERON_SELF_TURN_QUIESCE_MS", SELF_QUIESCE_MS.to_string());
-        }
+        unsafe { std::env::set_var("ZERON_TURN_QUIESCE_MS", QUIESCE_MS.to_string()) }
     });
 }
 
@@ -206,7 +198,7 @@ where
 }
 
 #[tokio::test]
-async fn self_continued_turn_parks_on_the_short_window() {
+async fn parked_late_output_stays_idle() {
     let rig = assemble("watch the build");
     rig.core
         .sessions
@@ -224,24 +216,17 @@ async fn self_continued_turn_parks_on_the_short_window() {
     )
     .await;
 
-    // Background wake: self-continued output past the resume gate.
+    // Background wake: late output after the completion boundary.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(text("The build is green. Released."))
         .unwrap();
-    wait_for(
-        || status(&rig.core) == Some(SessionStatus::Working),
-        "self-continued output resumes Working",
-    )
-    .await;
-
-    // The short window parks it well inside the 10s wait_for horizon — the
-    // normal window (10 min here) could not have.
-    wait_for(
-        || status(&rig.core) == Some(SessionStatus::Idle),
-        "short quiesce parks the self-continued turn",
-    )
-    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        status(&rig.core),
+        Some(SessionStatus::Idle),
+        "late background output must not reopen a completed turn"
+    );
 
     rig.core.sessions.shutdown().await;
 }
@@ -269,19 +254,9 @@ async fn steered_turn_keeps_the_normal_window() {
     )
     .await;
 
-    // Background wake resumes the session (short window armed)…
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    rig.feed.send(text("Build done.")).unwrap();
-    wait_for(
-        || status(&rig.core) == Some(SessionStatus::Working),
-        "self-continued output resumes Working",
-    )
-    .await;
-
-    // …then a real steer takes the turn over: the short window must stand
-    // down. The steered turn's reply streams and goes quiet — with the
-    // normal window at 10 minutes, the session must STAY Working well past
-    // the short window (its Done is genuinely coming).
+    // A real steer is the only event that opens a new turn. Its reply streams
+    // and goes quiet — with the normal window at 10 minutes, the session must
+    // STAY Working well past the test horizon (its Done is genuinely coming).
     rig.core
         .sessions
         .steer(CHAT, "and then?", None)
@@ -297,7 +272,7 @@ async fn steered_turn_keeps_the_normal_window() {
     assert_eq!(
         status(&rig.core),
         Some(SessionStatus::Working),
-        "a steered (prompt-owned) turn must not park on the short window"
+        "a live steered turn must not park before the normal watchdog window"
     );
 
     // Clean turn end.
