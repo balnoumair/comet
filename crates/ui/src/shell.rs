@@ -5834,12 +5834,16 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        // The shell tone (zeron `.frost`): the surface the sidebar sits on and
-        // the main panel floats over as an inset rounded card. On macOS the
-        // window background is the blurred desktop (lib.rs `Blurred`), so the
-        // frost paints translucent — the sidebar and card margins read as
-        // glass while the opaque card keeps text off it.
-        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        // The shell uses two explicit opaque dark planes: the near-black
+        // sidebar and the charcoal conversation surface. This keeps desktop
+        // content from bleeding through the local workspace.
+        let (frost, text, font, content_bg, sidebar_bg) = (
+            theme.glass(),
+            theme.text,
+            theme.font_sans.clone(),
+            theme.bg,
+            theme.surface,
+        );
         let (workspace_scope, auth) = {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
@@ -6013,14 +6017,14 @@ impl Render for Shell {
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
-                // flush and unbordered, the transcript directly on the frost
-                // glass; the changes pane is a flush left-bordered glass panel
-                // (built inside `render_right_pane`).
+                // flush and unbordered on the charcoal content plane; the
+                // changes pane is a flush left-bordered panel.
                 let card: AnyElement = div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_row()
+                    .bg(content_bg)
                     .overflow_hidden()
                     .child(main)
                     .into_any_element();
@@ -6038,7 +6042,7 @@ impl Render for Shell {
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
-                // Sidebar tone: a slightly lighter column behind the sidebar,
+                // Sidebar tone: the darker opaque column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,
                 // through the titlebar, down to the bottom edge). Its width
                 // rides the same tween as the sidebar, so the tone melts away
@@ -6052,11 +6056,11 @@ impl Render for Shell {
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
+                    .bg(sidebar_bg)
                     .border_r_1()
                     .border_color(border_color);
                 // The content row spans the FULL window height — the titlebar
-                // overlays it (glass, no fill), so the transcript can scroll
+                // overlays it without changing the content plane, so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.

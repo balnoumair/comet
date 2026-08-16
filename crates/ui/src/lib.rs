@@ -210,10 +210,8 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.
             app_owns_titlebar_drag: true,
-            // Frosted shell (macOS): blur the desktop behind the window; the
-            // shell paints its frost surface translucent so the sidebar reads
-            // as glass (shell.rs root). Elsewhere blur support is compositor
-            // roulette — stay opaque.
+            // The dark local shell is opaque; light mode may opt into its
+            // platform frost through the theme's window appearance.
             // One source of truth with the re-apply loop in `appearance::apply`
             // — if these two ever disagree, vibrancy dies on the first theme
             // change and never comes back.
