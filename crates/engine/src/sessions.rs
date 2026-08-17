@@ -1156,12 +1156,18 @@ async fn drive_run(
     // Late adapter output is treated as post-turn noise while parked, because
     // accepting it as a new turn can re-arm Working without a matching Done.
     // `ZERON_TURN_QUIESCE_MS` overrides the window; 0 disables.
+    // RETIRED for native drivers: a harness whose every turn shape ends with
+    // a deterministic wire Done (claude/codex/cursor native) needs no
+    // quiesce backstop — arming one only risks false parks on long silent
+    // work. The env knob still forces a window on for diagnostics.
+    let deterministic_turn_end = harness.deterministic_turn_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
         Some(0) => None,
         Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None if deterministic_turn_end => None,
         None => Some(std::time::Duration::from_secs(120)),
     };
     let mut last_stream_activity = tokio::time::Instant::now();
