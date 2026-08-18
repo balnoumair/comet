@@ -402,7 +402,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     }
 }
 
-
 /// Stamp stable local keys onto resolved tool parts that have full payloads.
 ///
 /// Separate from the fold because the fold is chat-agnostic and pure; the

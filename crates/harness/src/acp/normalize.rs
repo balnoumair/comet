@@ -94,11 +94,7 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
 /// The grok-native tool name stamped on a tool call's `_meta` (`x.ai/tool`,
 /// present on every grok tool_call — verified live, 1.0.4).
 pub(crate) fn xai_tool_name(update: &Value) -> Option<&str> {
-    update
-        .get("_meta")?
-        .get("x.ai/tool")?
-        .get("name")?
-        .as_str()
+    update.get("_meta")?.get("x.ai/tool")?.get("name")?.as_str()
 }
 
 /// First location path (`locations: [{path, line?}]`), for read/edit calls.
@@ -433,7 +429,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         })
         .collect()
 }
-
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.

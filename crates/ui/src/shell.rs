@@ -1598,15 +1598,21 @@ impl Shell {
                 title,
                 frozen,
             } => {
-                self.add_subagent_surface(chat_id.clone(), doc_id.clone(), title.clone(), *frozen, cx);
+                self.add_subagent_surface(
+                    chat_id.clone(),
+                    doc_id.clone(),
+                    title.clone(),
+                    *frozen,
+                    cx,
+                );
             }
         }
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,
-    /// or open one. `frozen` (subagent done/failed) tries the uploaded
-    /// transcript blob first and falls back to the live doc watch; running
-    /// subagents watch the doc directly.
+    /// or open one. Local-only mode reads the dedicated document for both
+    /// running and completed subagents; the hosted fork additionally tries a
+    /// frozen transcript blob for completed subagents.
     fn add_subagent_surface(
         &mut self,
         chat_id: String,
@@ -1660,44 +1666,18 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    /// Fetch a finished subagent's frozen transcript blob
-    /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
-    /// — the blob upload is best-effort engine-side.
+    /// Local-only fallback for a finished subagent. The hosted fork fetches a
+    /// static blob here, but this fork has no blob transport, so the
+    /// dedicated document remains the source of truth.
     fn spawn_subagent_snapshot_fetch(
         &self,
-        chat_id: &str,
+        _chat_id: &str,
         doc_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.state
-                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
-            return None;
-        };
-        let blob_ref = format!("{chat_id}/{doc_id}");
-        let state = self.state.clone();
-        let doc_id = doc_id.to_string();
-        Some(cx.spawn(async move |_, cx| {
-            let reply = crate::attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                methods::FETCH_TOOL_BLOB,
-                serde_json::json!({ "blobRef": blob_ref }),
-                Duration::from_secs(20),
-            )
-            .await;
-            let entries: Option<Vec<zeron_doc::SessionMessageEntry>> = reply.ok().and_then(|v| {
-                let text = v.get("text")?.as_str()?.to_owned();
-                serde_json::from_str(&text).ok()
-            });
-            state.update(cx, |s, cx| {
-                match entries {
-                    Some(entries) => s.set_subagent_snapshot(doc_id, entries),
-                    None => s.watch_subagent_doc(doc_id, cx),
-                }
-                cx.notify();
-            });
-        }))
+        self.state
+            .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
+        None
     }
 
     /// A surface tab's ✕. The active fallback happens naturally through
@@ -4698,12 +4678,7 @@ impl Shell {
                 .right(px(10.0))
                 .flex()
                 .justify_center()
-                .child(self.jump_pill(
-                    "jump-to-bottom",
-                    "jump-pill",
-                    self.transcript.clone(),
-                    cx,
-                ))
+                .child(self.jump_pill("jump-to-bottom", "jump-pill", self.transcript.clone(), cx))
                 .into_any_element(),
         )
     }

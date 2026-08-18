@@ -402,9 +402,32 @@ impl EngineHandle {
 
 /// Query the local engine identity.
 async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
-    client
+    match client
         .call_as(methods::ENGINE_INFO, serde_json::json!({}))
         .await
+    {
+        Ok(info) => Ok(info),
+        Err(err)
+            if matches!(&err, RpcError::UnknownMethod(method) if method == methods::ENGINE_INFO)
+                || matches!(&err, RpcError::Failed(message) if message == &format!("unknown method: {}", methods::ENGINE_INFO)) =>
+        {
+            // Older daemons expose only LocalDevice. Keep them attachable, but
+            // conservatively route them through the synced/account gate.
+            let device: serde_json::Value = client
+                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await?;
+            let device_id = device
+                .get("deviceId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| RpcError::BadParams("legacy LocalDevice lacks deviceId".into()))?;
+            Ok(EngineInfo {
+                device_id: device_id.into(),
+                workspace_scope: WorkspaceScope::Synced,
+            })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,15 +1894,6 @@ mod tests {
             .unwrap();
         assert_eq!(info, *handle.engine_info());
 
-        let mut auth = handle
-            .client()
-            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
-            .await
-            .unwrap();
-        assert_eq!(
-            parse_auth_state(&auth.recv().await.unwrap()),
-            Some(AuthState::SignedOut)
-        );
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
@@ -1895,7 +1909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
+    async fn local_boot_ignores_legacy_cloud_session() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("session.json"),
@@ -1916,25 +1930,21 @@ mod tests {
                 .expect("embedded lifecycle")
                 .borrow()
                 .clone(),
-            DeferredEngineState::Waiting
+            DeferredEngineState::Ready
         ));
 
         let info: EngineInfo = handle
             .client()
             .call_as(methods::ENGINE_INFO, serde_json::json!({}))
             .await
-            .expect("EngineInfo bypasses deferred cloud stores");
-        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+            .expect("local EngineInfo is available after assembly");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Local);
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                handle
-                    .client()
-                    .call(methods::LIST_HARNESSES, serde_json::json!({})),
-            )
-            .await
-            .is_err(),
-            "cloud data waits for organization onboarding"
+            handle
+                .client()
+                .call(methods::LIST_HARNESSES, serde_json::json!({}))
+                .await
+                .is_ok()
         );
         assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
@@ -1948,7 +1958,6 @@ mod tests {
             daemon_dir.path(),
             Arc::new(default_registry()),
             HarnessId::Mock,
-            None,
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1969,10 +1978,7 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}")
             }
         );
-        assert_eq!(
-            handle.engine_info().workspace_scope,
-            WorkspaceScope::Development
-        );
+        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
@@ -2469,7 +2475,10 @@ mod tests {
             gate_phase(
                 &ConnectionStatus::Ready,
                 Some(WorkspaceScope::Synced),
-                Some(&AuthState::SignedIn { user: user.clone() })
+                Some(&AuthState::SignedIn {
+                    user: user.clone(),
+                    org_id: Some("org-1".into()),
+                }),
             ),
             GatePhase::Ready
         );

@@ -141,6 +141,40 @@ impl CursorHarness {
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
     }
 
+    /// Ask the installed Cursor CLI for its model catalog. The CLI already
+    /// has the user's Cursor login, while `@cursor/sdk` uses a separate
+    /// credential store and currently rejects `Cursor.models.list()` without
+    /// an API key. The CLI output is intentionally text, so this is a
+    /// compatibility fallback rather than the primary typed-options source.
+    async fn discover_cli_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let exe = crate::acp::find_on_paths("cursor-agent", cursor_cli_paths())
+            .ok_or_else(|| HarnessError::NotInstalled("cursor-agent".into()))?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+            .await
+            .map_err(|_| HarnessError::Protocol("cursor CLI models probe timed out".into()))?
+            .map_err(|e| HarnessError::Protocol(format!("cursor CLI models probe: {e}")))?;
+        let models = parse_cli_models(&String::from_utf8_lossy(&output.stdout));
+        if !output.status.success() && models.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(HarnessError::Protocol(format!(
+                "cursor CLI models probe failed: {}",
+                stderr.trim()
+            )));
+        }
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "cursor CLI models probe returned no catalog".into(),
+            ));
+        }
+        Ok(models)
+    }
+
     /// (program, args) for the shim process: the test override, or node
     /// running the shim inside the managed SDK install (installing it on
     /// first use).
@@ -205,20 +239,47 @@ impl Harness for CursorHarness {
         true
     }
 
-    /// Live catalog via the shim's models mode (`Cursor.models.list()` —
-    /// public, no auth; verified live on 1.0.28). Falls back to a minimal
-    /// static pair when the probe fails, UNCACHED so the next picker open
-    /// retries.
+    /// Live catalog via the installed Cursor CLI, with the SDK shim as a
+    /// fallback for environments that have an SDK API key but no CLI login.
+    /// A minimal static pair remains the last resort and is intentionally not
+    /// cached, so the next picker open retries discovery.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
+        }
+
+        // `with_executable` is the fake-shim test seam; do not let a host
+        // Cursor installation change those deterministic tests.
+        if self.executable.is_none() {
+            match self.discover_cli_models().await {
+                Ok(models) if !models.is_empty() => {
+                    let _ = self.models_cache.set(models.clone());
+                    return Ok(models);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(
+                        target: "zeron_harness::cursor",
+                        error = %err,
+                        "cursor CLI model discovery unavailable; trying SDK"
+                    );
+                }
+            }
         }
         match self.discover_models().await {
             Ok(models) if !models.is_empty() => {
                 let _ = self.models_cache.set(models.clone());
                 Ok(models)
             }
-            Ok(_) | Err(_) => Ok(static_models()),
+            Ok(_) => Ok(static_models()),
+            Err(err) => {
+                tracing::debug!(
+                    target: "zeron_harness::cursor",
+                    error = %err,
+                    "cursor SDK model discovery unavailable; using fallback catalog"
+                );
+                Ok(static_models())
+            }
         }
     }
 
@@ -320,6 +381,29 @@ fn static_models() -> Vec<Model> {
             options: Vec::new(),
         },
     ]
+}
+
+/// Parse the stable human-readable shape emitted by `cursor-agent models`:
+/// `model-id - Display Name`. Unknown headings and diagnostics are ignored.
+fn parse_cli_models(output: &str) -> Vec<Model> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, label) = line.trim().split_once(" - ")?;
+            let id = id.trim();
+            let label = label.trim();
+            if id.is_empty() || label.is_empty() || id.chars().any(char::is_whitespace) {
+                return None;
+            }
+            Some(Model {
+                id: id.into(),
+                label: label.into(),
+                description: None,
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// `Cursor.models.list()` items → picker models. Item shape (1.0.28
@@ -894,10 +978,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {
@@ -907,5 +990,17 @@ mod tests {
                 }),
             }]
         );
+    }
+
+    #[test]
+    fn parses_cursor_cli_model_catalog_and_ignores_headings() {
+        let models = parse_cli_models(
+            "Available models\n\nauto - Auto (current, default)\n\ngpt-5.3-codex - Codex 5.3\n",
+        );
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "auto");
+        assert_eq!(models[0].label, "Auto (current, default)");
+        assert_eq!(models[1].id, "gpt-5.3-codex");
+        assert_eq!(models[1].label, "Codex 5.3");
     }
 }

@@ -939,7 +939,6 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
-
 // ── subagent docs ───────────────────────────────────────────────────────────
 
 /// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
@@ -994,21 +993,18 @@ impl SubagentSink {
                 self.written = written;
                 r
             }
-            None => match SegmentWriter::begin(
-                &self.doc,
-                &self.entry_id,
-                device_id,
-                self.started_at,
-            ) {
-                Ok(mut w) => {
-                    let r = w.sync(&rendered);
-                    let (ix, written) = w.into_state();
-                    self.entry_index = Some(ix);
-                    self.written = written;
-                    r
+            None => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(mut w) => {
+                        let r = w.sync(&rendered);
+                        let (ix, written) = w.into_state();
+                        self.entry_index = Some(ix);
+                        self.written = written;
+                        r
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
         };
         if let Err(err) = result {
             // Fail soft: a broken subagent doc degrades to chip-only, never
@@ -1292,28 +1288,6 @@ async fn drive_run(
         None => Some(std::time::Duration::from_secs(120)),
     };
     let mut last_stream_activity = tokio::time::Instant::now();
-    // SELF-CONTINUED turns get a much SHORTER quiesce window. A turn the
-    // agent starts on its own (background-task wake) can never receive a
-    // harness Done: the adapter has no `session/prompt` outstanding to
-    // settle — verified in claude-agent-acp's autonomous-result lane, which
-    // consumes the SDK's turn-end without emitting anything; codex shows
-    // the same shape. The watchdog is that turn shape's ONLY settle path,
-    // so the default 120s window read as 2min of stuck-Working after every
-    // background notification (user report 2026-08-13). The in-flight
-    // fold gate below still protects running tools; reasoning heartbeats
-    // push the window during real thinking. `ZERON_SELF_TURN_QUIESCE_MS`
-    // overrides; 0 falls back to the normal window. An explicit
-    // `ZERON_TURN_QUIESCE_MS=0` still disables the watchdog entirely.
-    let self_quiesce_after: Option<std::time::Duration> =
-        match std::env::var("ZERON_SELF_TURN_QUIESCE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            Some(0) => None,
-            Some(ms) => Some(std::time::Duration::from_millis(ms)),
-            None => Some(std::time::Duration::from_secs(20)),
-        };
-    let mut self_continued_turn = false;
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -1475,9 +1449,9 @@ async fn drive_run(
         {
             inner.publish(&chat_id, &event);
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
-            let chip_streaming = folded.iter().any(
-                |p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id),
-            );
+            let chip_streaming = folded
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id));
             let sink_known = subagents.contains_key(parent_tool_use_id);
             if chip_streaming {
                 if !sink_known {
@@ -1502,8 +1476,7 @@ async fn drive_run(
             // A Done with NO sink (a subagent that never streamed — codex
             // turn ends can beat registration) is chip-only: minting a doc
             // just to freeze it empty helps no one.
-            let done_only = !sink_known
-                && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.doc_arc()),
@@ -1563,24 +1536,11 @@ async fn drive_run(
                         _ => MessageStatus::Complete,
                     };
                     let sink = subagents.remove(parent_tool_use_id).expect("checked");
-                    let doc_id = sink.doc_id.clone();
-                    // FREEZE: the finished transcript uploads as a static R2
-                    // blob (`blob/{chatId}/{subDocId}`) so viewers of
-                    // finished subagents never wake the doc's room; dropping
-                    // the sink unpins the doc for the LRU and the room
-                    // idles. The live doc remains the fallback.
-                    if let Some(json) = sink.finish(&device_id, status)
-                        && let Some(host) = inner.doc_host()
-                    {
-                        host.upload_tool_sidecar(
-                            &chat_id,
-                            zeron_doc::SidecarPayload {
-                                part_id: doc_id,
-                                output: Some(json),
-                                diff: None,
-                            },
-                        );
-                    }
+                    // Local-only mode keeps the finished transcript in its
+                    // dedicated document. The hosted fork additionally
+                    // freezes it into an R2 sidecar; that transport is not
+                    // part of this fork.
+                    let _ = sink.finish(&device_id, status);
                 }
             }
             continue;
@@ -1909,20 +1869,8 @@ async fn drive_run(
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
     for (parent_id, sink) in subagents.drain() {
-        let doc_id = sink.doc_id.clone();
         let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
-        if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
-            && let Some(host) = inner.doc_host()
-        {
-            host.upload_tool_sidecar(
-                &chat_id,
-                zeron_doc::SidecarPayload {
-                    part_id: doc_id,
-                    output: Some(json),
-                    diff: None,
-                },
-            );
-        }
+        let _ = sink.finish(&device_id, MessageStatus::Aborted);
     }
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
