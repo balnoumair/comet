@@ -1,72 +1,96 @@
-# Rust harness integration: Claude Code + Codex (2026-07)
+# Harness integration (2026-08)
 
-## Decision
-- Claude Code: spawn installed `claude` CLI, speak stream-json directly. NO crates.io SDK dep
-  (crate "claude-agent-sdk" is name-squatted w/ fake anthropics repo; `claude-codes` 2.1.x is a
-  reasonable serde-types reference to vendor from). Python SDK source = authoritative wire spec.
-- Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio — port zeron's codex.ts (which already
-  bypasses the SDK). Only option with token deltas + turn/steer + turn/interrupt + thread/resume +
-  model/list + approval requests. codex-rs crates are NOT published (git dep not recommended).
-  `codex exec --json` = CI-only surface (no deltas/steer/approvals).
+The harness crate gives the engine one `Harness` interface while keeping each
+agent's native transport where it is strongest. The shared contract normalizes
+agent output into `AgentEvent`, exposes model/command discovery, bridges user
+questions, and provides steering and cancellation controls.
 
-## Claude CLI protocol
-- One-shot: `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages [--bare]`
-  (--bare skips hooks/skills/CLAUDE.md/MCP auto-discovery; will become default for -p).
-- Steerable: add `--input-format stream-json`, keep stdin open.
-  - stdin user turn: {"type":"user","message":{"role":"user","content":"..."},"parent_tool_use_id":null}
-    — steering = another such line mid-run (consumed at step boundary).
-- stdout frames (JSONL):
-  - system/init: model, tools[], cwd, session_id, capabilities[] (v2.1.205+; feature-detect here,
-    e.g. interrupt_receipt_v1)
-  - system/api_retry: error categories authentication_failed|oauth_org_not_allowed|billing_error|
-    rate_limit|overloaded|invalid_request|model_not_found|max_output_tokens|server_error|unknown
-  - stream_event: raw API deltas (content_block_delta -> text_delta/thinking_delta); has
-    parent_tool_use_id (subagent frames non-null -> filter)
-  - assistant / user messages (tool_use / tool_result blocks), rate_limit_event
-  - result: subtype success|error_*, usage, session_id (last line)
-- Control channel (bidirectional control_request/control_response, request_id-multiplexed):
-  - client->CLI: initialize, interrupt, set_permission_mode, set_model, rewind_files,
-    mcp_reconnect/toggle/status, get_context_usage, stop_task; model discovery is a control req.
-  - CLI->client: can_use_tool {tool_name, input, permission_suggestions...} — reply
-    {"behavior":"allow","updatedInput":{...}} or {"behavior":"deny","message":...}.
-    AskUserQuestion ALWAYS reaches can_use_tool -> intercept, requestInput UI, allow with
-    updatedInput.answers. (Same mechanism as zeron claude.ts.)
-  - interrupt: control request; >=2.1.205 response carries {still_queued:[uuids]}.
-- Resume: --resume=<session_id> (equals form; cwd-scoped), --continue, --fork-session.
-- One-shot interrupt: SIGTERM (kills bash trees, runs SessionEnd hooks, exit 143).
-- Input side de facto stable but undocumented (claude-code#24594) — pin min CLI version + gate on
-  capabilities.
+## Driver split
 
-## Codex app-server protocol
-- Handshake: initialize {clientInfo, capabilities{experimentalApi, optOutNotificationMethods}} ->
-  initialized notification. Overload = JSON-RPC error -32001.
-- thread/start {model?, cwd, approvalPolicy, sandbox} -> thread.id; thread/resume {threadId}
-  (fallback to thread/start if rollout missing).
-- turn/start {threadId, input:[{type:"text",text}], model?, effort?, sandboxPolicy, approvalPolicy};
-  turn/steer {threadId, expectedTurnId, input}; turn/interrupt {threadId, turnId}.
-- Notifications: turn/started|completed{usage}|failed|aborted; item/started|completed
-  (item.type: agent_message, reasoning, command_execution, file_change, mcp_tool_call, web_search,
-  todo_list); deltas item/agentMessage/delta, item/reasoning/textDelta|summaryTextDelta,
-  item/commandExecution/outputDelta, item/plan/delta; thread/tokenUsage/updated.
-- Server->client approval REQUESTS (must answer): item/commandExecution/requestApproval,
-  item/fileChange/requestApproval -> {accept|acceptForSession|decline|cancel}.
-- model/list {cursor?} -> supportedReasoningEfforts, service tiers (experimentalApi).
-- Types: `codex app-server generate-json-schema` per installed version -> generate Rust types
-  (typify) or hand-write tolerant serde (both delta field spellings, ignore unknown methods).
-- Child lifecycle hardening from codex.ts to port: SIGTERM->SIGKILL escalation, signal-death !=
-  clean exit, EPIPE swallowing.
+| Agent | Driver | Transport | Steering |
+|---|---|---|---|
+| Claude Code | native `ClaudeHarness` | `claude` stream-json over stdio | CLI step boundary |
+| Codex | native `CodexHarness` | `codex app-server`, JSON-RPC over stdio | `turn/steer`, queued fallback |
+| Cursor | native `CursorHarness` | pinned `@cursor/sdk` through a Node JSONL shim | turn boundary |
+| Grok Build | `AcpHarness` | ACP v1 over stdio | ACP extension or turn boundary |
+| Hermes | `AcpHarness` | `hermes acp`, ACP v1 over stdio | turn boundary |
+| Pi | `AcpHarness` | community `pi-acp` adapter | turn boundary |
 
-## Shared shape
-Both reduce to: spawn child, frame JSONL stdout (+ id-multiplexing), write stdin lines, map to one
-AgentEvent enum, mpsc steering mailbox, cancellation token kills child.
+Claude, Codex, and Cursor use native drivers rather than ACP adapters. Their
+native wires expose better terminal-turn semantics and preserve capabilities
+that the adapter layer either hid or represented ambiguously. ACP remains for
+agents that are built around ACP or do not yet have a native driver. The
+protocol details for that shared surface are in [acp.md](acp.md).
 
-## Capability matrix to replicate (from packages/harness)
-Normalized AgentEvent stream; typed ToolCall decoding (Bash/Read/Write/Edit/Grep/Glob/WebFetch/
-WebSearch/TodoWrite -> Exec/ReadFile/...; codex item types); model discovery + effort ladders +
-options ([1m] context suffix, fastMode, thinking, service tiers); ultrathink = prompt prefix,
-ultracode = xhigh + setting; sandbox mapping; AskUserQuestion -> requestInput; resume; interrupt;
-steering (step-boundary via stdin / turn/steer with expectedTurnId + turn/start fallback);
-subagent frame filtering; error-code mapping.
-(Citations in agent transcript: code.claude.com/docs/en/headless, agent-sdk/typescript,
-claude-code#24594, claude-agent-sdk-python query.py/subprocess_cli.py, Codex app-server docs +
-README, openai.com "Unlocking the Codex harness", codex#5028.)
+## Shared runtime contract
+
+Every driver:
+
+- resolves an installed CLI or a managed, pinned adapter/shim;
+- composes a GUI-safe child `PATH` through Node version-manager locations;
+- reads framed child output and maps it to the common `AgentEvent` stream;
+- keeps a bounded stderr tail for actionable crash errors;
+- bridges permission/question requests through `RunControls::request_input`;
+- accepts queued steering through `RunControls::steering`; and
+- cancels through the agent protocol first, then escalates from SIGTERM to
+  SIGKILL when the child does not exit.
+
+The engine owns session persistence and resume continuity. Harness-native
+session identifiers are recorded against the chat, while the durable chat
+document and run journal remain the source of truth across engine restarts.
+
+## Native drivers
+
+### Claude Code
+
+`ClaudeHarness` speaks the CLI's stream-json protocol directly. JSONL frames
+are normalized into text, reasoning, tool, usage, question, and terminal events.
+Permission requests use Claude's stdio control channel; questions are routed to
+the input panel. The CLI's `result` frame ends a turn, and
+`parent_tool_use_id` tags background subagent events so they remain separate
+from the parent transcript. Model discovery uses the driver's catalog and
+short-lived CLI probes.
+
+### Codex
+
+`CodexHarness` starts `codex app-server` and speaks JSON-RPC 2.0. It maps
+`thread/start`/`thread/resume`, `turn/start`, `turn/steer`, and
+`turn/interrupt`, together with item lifecycle and token-usage notifications.
+Child app-server threads are routed as tagged subagent events. Model and
+reasoning options come from the Codex catalog and the app-server discovery
+surface. The driver is validated against the experimental API used by
+codex-cli 0.146.1, so the wire should be rechecked when that CLI changes.
+
+### Cursor
+
+`CursorHarness` runs the pinned `@cursor/sdk` through the managed
+`zeron-cursor-shim.mjs` Node process. The SDK provides the agent runtime and
+full nested subagent transcript; the shim translates its JSONL frames into
+Rust events. SDK credentials are separate from `cursor-agent login`.
+
+For model discovery, the harness first uses the authenticated
+`cursor-agent models` catalog, then tries SDK discovery, and finally falls
+back to the minimal Auto/Composer list. The CLI fallback matters because the
+Cursor CLI and SDK can have separate credential stores.
+
+## ACP driver
+
+`AcpHarness` is retained for Grok, Hermes, and Pi. It performs the ACP v1
+handshake, creates or loads a session, maps `session/update` notifications,
+discovers model/config options, and uses the prompt response's stop reason for
+turn completion. Permission requests are auto-accepted for unattended runs;
+question-shaped requests use the engine input bridge. Agents without a
+mid-turn steering extension queue steering for the next prompt.
+
+## Model discovery and completion
+
+Model discovery is intentionally short-lived and cached only after a
+non-empty catalog succeeds. Native drivers use their own catalogs or CLI
+surfaces; ACP drivers probe the agent's advertised model/config options. The
+picker normalizes aliases and keeps model options separate from reasoning
+levels.
+
+Native drivers report terminal completion from the agent's own terminal frame.
+ACP drivers use the protocol stop reason, with the engine watchdog retained as
+a backstop for adapter-mediated agents. A run must always finish with one
+common `Done` event, including interruption and protocol failure paths.
