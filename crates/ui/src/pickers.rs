@@ -3662,9 +3662,11 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 }
 
 /// What the composer actually offers: [`visible_harnesses`] narrowed to the
-/// catalog device's enabled set (Settings → Agents — per-device state, so a
-/// space on another device follows THAT device's toggles). The dev-rig mock
-/// opt-in survives the filter. An empty enabled set stays empty: resurfacing
+/// catalog device's enabled set AND installed CLIs (Settings → Agents is
+/// per-device state, so a space on another device follows THAT device's
+/// toggles; a default-enabled agent whose CLI is missing would only
+/// manufacture NotInstalled errors at send). The dev-rig mock opt-in
+/// survives the filter. An empty result stays empty: resurfacing
 /// uninstalled harnesses here only defers the failure until run time.
 pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     offered_harnesses_impl(list, mock_harness_enabled())
@@ -3672,11 +3674,12 @@ pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
 
 fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
     visible_harnesses_impl(list, allow_mock)
-        .iter()
+        .into_iter()
         .filter(|d| {
-            zeron_engine::registry::descriptor_enabled(d) || (allow_mock && d.id == HarnessId::Mock)
+            d.installed
+                && (zeron_engine::registry::descriptor_enabled(d)
+                    || (allow_mock && d.id == HarnessId::Mock))
         })
-        .cloned()
         .collect()
 }
 
@@ -4388,5 +4391,44 @@ mod tests {
         let mut missing = catalog(None, None, None);
         missing.iter_mut().for_each(|d| d.installed = false);
         assert!(offered_harnesses_impl(&missing, false).is_empty());
+    }
+
+    #[test]
+    fn offered_harnesses_require_an_installed_cli() {
+        let descriptor =
+            |id: HarnessId, name: &str, enabled: Option<bool>, installed: bool| HarnessDescriptor {
+                id,
+                name: name.into(),
+                supports_steering: true,
+                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed,
+                enabled,
+            };
+        // Enabled-but-missing-CLI agents stay out of the rail; an installed
+        // enabled one rides along (the default-enabled, CLI-less Claude/Codex
+        // machine — Settings → Agents lets the user turn them off too).
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code", Some(true), false),
+            descriptor(HarnessId::Codex, "Codex", Some(true), false),
+            descriptor(HarnessId::Grok, "Grok", Some(true), true),
+        ];
+        let offered = offered_harnesses_impl(&catalog, false);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![HarnessId::Grok]
+        );
+        // Nothing enabled AND installed: an empty offered set — the fresh
+        // machine where the default-enabled Claude/Codex have no CLIs (#128).
+        // No fallback: offering them again would only manufacture
+        // NotInstalled errors at send; the composer shows the no-agents
+        // state and blocks new sends instead.
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code", Some(true), false),
+            descriptor(HarnessId::Codex, "Codex", Some(false), false),
+            descriptor(HarnessId::Grok, "Grok", Some(false), true),
+        ];
+        let offered = offered_harnesses_impl(&catalog, false);
+        assert!(offered.is_empty());
     }
 }
