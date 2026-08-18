@@ -366,12 +366,6 @@ pub fn flip_morph_step(
     })
 }
 
-/// Engines at or above this version understand `pending://` attachment refs
-/// and QueueCommand `transfers` (send-is-a-local-write attachments). Gated on
-/// BOTH the local engine (an IPC daemon may be older than this UI) and, for
-/// remotely-hosted chats, the host device's stamped registry version.
-const QUEUED_ATTACHMENTS_MIN: (u64, u64, u64) = (0, 2, 12);
-
 /// What the send button is right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendButtonMode {
@@ -3335,11 +3329,6 @@ pub struct Composer {
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
-    /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
-    /// connected"). Chat-scoped failures survive navigation and render only
-    /// under their own chat — a blanket clear-on-switch erased the one
-    /// visible trace of a failed send (2026-08-19).
-    failure_key: Option<String>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3347,11 +3336,6 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
-    /// Interrupt/answer commands get their own slot: assigning `send_task`
-    /// DROPPED an in-flight send future mid-upload — no banner, no cleanup,
-    /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
-    /// a send grinds" shape).
-    action_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3467,8 +3451,6 @@ impl Composer {
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
-            failure_key: None,
-            action_task: None,
             advance_task: None,
             send_task: None,
             expanded_mode: false,
@@ -3568,7 +3550,6 @@ impl Composer {
                 Ok(att) => staged.push(att),
                 Err(message) => {
                     self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
                     cx.notify();
                 }
             }
@@ -4348,10 +4329,7 @@ impl Composer {
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
-            // `failure` deliberately survives navigation: chat-scoped
-            // failures render only under their own chat (see `failure_key`),
-            // so switching away and back must not erase the one visible
-            // trace of a failed send.
+            self.failure = None;
             self.wizard = None;
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
@@ -4471,7 +4449,6 @@ impl Composer {
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
-            self.failure_key = None; // global — meaningful on every chat
             cx.notify();
             return;
         };
@@ -4550,55 +4527,17 @@ impl Composer {
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
-        // Queued-attachment flow (durable-by-design): stage the bytes on the
-        // LOCAL engine, queue the command immediately with `pending://` refs,
-        // and let the engine push the bytes to a remote host afterwards —
-        // staging must never gate the queue (2026-08-19 incident: a send
-        // died with a zombie peer link because the upload sat in front of
-        // QueueCommand). Requires every engine involved to understand the
-        // ref scheme — the local engine (an IPC daemon may be older than
-        // this UI) and, for remotely-hosted chats, the host; anything older
-        // keeps the legacy blocking upload.
-        let host_is_remote = host_device_id
-            .as_deref()
-            .is_some_and(|id| local_device_id.as_deref() != Some(id));
-        let queued_flow = !staged.is_empty() && {
-            let state = self.state.read(cx);
-            let local_ok = local_device_id
-                .as_deref()
-                .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
-            let host_ok = !host_is_remote
-                || host_device_id
-                    .as_deref()
-                    .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
-            local_ok && host_ok
-        };
-        // Upload identities minted NOW: in the queued flow the `pending://`
-        // ref IS the persisted transport until the host rewrites it, so the
-        // id must exist before any bytes move.
-        let upload_ids: Vec<String> = staged
+        // The echo carries synthetic attachment refs from the first frame, so
+        // photos render while the send is still pending instead of waiting for
+        // the upload to finish (real paths replace them in the post-upload
+        // refresh). The refs resolve instantly: the staged bytes are seeded
+        // into the transcript cache under every device key the transcript
+        // consults, and the synthetic paths never persist — the queued command
+        // and the doc entry are built from `with_attachments` on real paths.
+        let echo_paths: Vec<String> = staged
             .iter()
-            .map(|_| uuid::Uuid::new_v4().to_string())
+            .map(|att| format!("pending/{}/{}", att.id, att.name))
             .collect();
-        // The echo carries attachment refs from the first frame, so photos
-        // render while the send is still pending. Queued flow: the refs are
-        // the real `pending://` identities (stable — no post-upload refresh).
-        // Legacy flow: synthetic `pending/…` paths that the post-upload
-        // refresh replaces with the host's absolute paths. Either way the
-        // staged bytes are seeded into the transcript cache under every
-        // device key the transcript consults.
-        let echo_paths: Vec<String> = if queued_flow {
-            staged
-                .iter()
-                .zip(&upload_ids)
-                .map(|(att, id)| format!("pending://{id}/{}", att.name))
-                .collect()
-        } else {
-            staged
-                .iter()
-                .map(|att| format!("pending/{}/{}", att.id, att.name))
-                .collect()
-        };
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         for (path, att) in echo_paths.iter().zip(&staged) {
             attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
@@ -4694,20 +4633,10 @@ impl Composer {
                             // know the spec degrades to the main checkout
                             // instead of failing the run.
                             chat_branch = base.clone();
-                            if let Some(repo_path) = &space_path {
-                                // A remote repo's branch list loads over the
-                                // relay — on a bad link it may never arrive
-                                // and the picker has no base. That must NOT
-                                // silently drop the isolation the user picked
-                                // (2026-08-19: "New worktree" ran in the main
-                                // checkout): default to HEAD, which git — any
-                                // host version — resolves as the repo's
-                                // current checkout state.
-                                let base =
-                                    base.clone().unwrap_or_else(|| "HEAD".to_string());
+                            if let (Some(repo_path), Some(base)) = (&space_path, base) {
                                 run_worktree = Some(zeron_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
-                                    base,
+                                    base: base.clone(),
                                 });
                             }
                         }
@@ -4759,33 +4688,21 @@ impl Composer {
                             object.insert("config".into(), config);
                         }
                     }
-                    if let Err(err) = attachments::call_with_timeout(
-                        &engine,
-                        cx.background_executor(),
-                        methods::MUTATE,
-                        mutate,
-                        std::time::Duration::from_secs(30),
-                    )
-                    .await
-                    {
+                    if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
                         tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
 
-                // Attachments. Queued flow: commit the bytes to the LOCAL
-                // engine's uploads dir (fast, offline-safe) — the queued
-                // command carries the `pending://` refs and the engine
-                // delivers the bytes to a remote host afterwards, retrying
-                // until they land. Legacy flow (old engines): stage on the
-                // host device up front, bounded by a total budget so a
-                // degraded link fails the send loudly instead of grinding
-                // through silent per-chunk retries for minutes.
+                // Stage every attachment on the host device (sequential — the
+                // chunks share one channel), then thread the refs into the
+                // prompt text (`with_attachments`, the persisted transport)
+                // and the paths onto the Run request (inline image blocks).
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
-                let mut transfers: Vec<serde_json::Value> = Vec::new();
-                if !staged.is_empty() && queued_flow {
-                    // Local staging is disk-speed; publish progress anyway so
-                    // huge files still narrate.
+                if !staged.is_empty() {
+                    // Publish upload progress so the working label can read
+                    // "Uploading… N%" instead of an opaque "Sending…" while
+                    // the chunks cross the relay.
                     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                     let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
                     {
@@ -4798,54 +4715,11 @@ impl Composer {
                         })
                         .ok();
                     }
-                    for (att, upload_id) in staged.iter().zip(&upload_ids) {
-                        if let Err(err) = attachments::upload_attachment(
-                            &engine,
-                            cx.background_executor(),
-                            None,
-                            upload_id,
-                            att,
-                            Some(progress.clone()),
-                        )
-                        .await
-                        {
-                            tracing::warn!(name = %att.name, error = %err, "local attachment stage failed");
-                            return Err("Couldn't stage the attachment locally.".to_string());
-                        }
-                        transfers.push(serde_json::json!({
-                            "uploadId": upload_id,
-                            "fileName": att.name,
-                        }));
-                    }
-                    // The echo refs ARE the persisted refs — no refresh pass.
-                    attachment_paths = echo_paths.clone();
-                    content = echo_text.clone();
-                } else if !staged.is_empty() {
-                    // Legacy flow (old engines): stage on the host device up
-                    // front. Publish upload progress so the working label can
-                    // read "Uploading… N%" instead of an opaque "Sending…"
-                    // while the chunks cross the relay; the per-attachment
-                    // deadline inside `upload_attachment` bounds the whole
-                    // crawl (2026-08-19: silent per-chunk retries ground for
-                    // minutes with no total budget).
-                    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                    let total: u64 = staged.iter().map(|a| a.bytes().len() as u64).sum();
-                    {
-                        let progress = progress.clone();
-                        this.update(cx, |composer, cx| {
-                            composer.state.update(cx, |s, cx| {
-                                s.begin_upload_progress(total, progress);
-                                cx.notify();
-                            });
-                        })
-                        .ok();
-                    }
-                    for (att, upload_id) in staged.iter().zip(&upload_ids) {
+                    for att in &staged {
                         match attachments::upload_attachment(
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
-                            upload_id,
                             att,
                             Some(progress.clone()),
                         )
@@ -4923,22 +4797,12 @@ impl Composer {
                 };
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
-                let mut params = serde_json::json!({ "chatId": chat_id, "command": command });
-                if !transfers.is_empty() {
-                    params["transfers"] = serde_json::Value::Array(transfers);
-                }
-                // Deadline-bounded: QueueCommand is a local write (in-process
-                // or IPC), but a deferred engine handle can park forever —
-                // the send task must never grind silently (2026-08-19).
-                attachments::call_with_timeout(
-                    &engine,
-                    cx.background_executor(),
-                    methods::QUEUE_COMMAND,
-                    params,
-                    std::time::Duration::from_secs(30),
-                )
-                .await
-                .map_err(|e| format!("Send failed: {e}"))?;
+                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                engine
+                    .client()
+                    .call(methods::QUEUE_COMMAND, params)
+                    .await
+                    .map_err(|e| format!("Send failed: {e}"))?;
                 Ok(())
             }
             .await;
@@ -4951,7 +4815,6 @@ impl Composer {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the chat's stash.
                     composer.failure = Some(message.into());
-                    composer.failure_key = Some(err_chat_id.clone());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.end_pending_send(&err_chat_id, &err_message_id);
@@ -4989,19 +4852,15 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
-        let failure_chat = chat_id.clone();
         let params = serde_json::json!({
             "chatId": chat_id,
             "command": { "kind": "interrupt" },
         });
-        // `action_task`, NOT `send_task`: a Stop pressed while a send is in
-        // flight must not drop the send future on the floor.
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Stop failed: {err}").into());
-                    composer.failure_key = Some(failure_chat);
                     cx.notify();
                 })
                 .ok();
@@ -5089,18 +4948,15 @@ impl Composer {
             request_id: request_id.clone(),
             answers,
         };
-        let failure_chat = chat_id.clone();
         let params = match serde_json::to_value(&command) {
             Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
             Err(_) => return,
         };
-        // `action_task`, NOT `send_task` — see `interrupt`.
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Answer failed: {err}").into());
-                    composer.failure_key = Some(failure_chat);
                     // The answer never left this device — put the panel back.
                     composer.answered_requests.remove(&request_id);
                     cx.notify();
@@ -5257,7 +5113,7 @@ impl Composer {
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
-            .when(!theme.is_frost(), |el| el.shadow_lg())
+            .when(!theme.is_glass(), |el| el.shadow_lg())
             .flex()
             .flex_col()
             .child(
@@ -5541,43 +5397,7 @@ impl Render for Composer {
         );
         let expanded = self.expanded_mode;
 
-        // Chat-scoped failures render only under their own chat; a global
-        // failure (no key) renders everywhere.
-        let failure = self.failure.clone().filter(|_| {
-            self.failure_key
-                .as_ref()
-                .is_none_or(|key| *key == self.current_key)
-        });
-        // Composer honesty: when the target's delivery path is degraded, say
-        // UP FRONT that a send will queue (a durable local write delivered on
-        // reconnect) instead of letting the button imply instant delivery.
-        let queue_notice: Option<(SharedString, bool)> = {
-            use zeron_proto::ConnectivityState as S;
-            let state = self.state.read(cx);
-            let degraded = match state.selected_chat.as_deref() {
-                Some(id) => state.chat_delivery_degraded(id),
-                None => {
-                    // New-chat canvas: judge by the picked target device.
-                    let remote_target = state
-                        .effective_device_id()
-                        .is_some_and(|id| state.local_device_id.as_deref() != Some(id.as_str()));
-                    remote_target
-                        && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
-                            || state
-                                .effective_device_id()
-                                .is_some_and(|id| !state.device_online(&id, chrono::Utc::now())))
-                }
-            };
-            let offline = state.connectivity.state == S::Offline;
-            degraded.then(|| {
-                let text: SharedString = if offline {
-                    "Offline — messages will send when you're back online.".into()
-                } else {
-                    "Messages will send once the connection recovers.".into()
-                };
-                (text, offline)
-            })
-        };
+        let failure = self.failure.clone();
         // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
@@ -5633,7 +5453,6 @@ impl Render for Composer {
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.failure = None;
-                            this.failure_key = None;
                             cx.notify();
                         }))
                         .child(
@@ -5644,32 +5463,6 @@ impl Render for Composer {
                         )
                         .child(div().min_w_0().child(message)),
                 )
-            })
-            .when_some(queue_notice, |el, (notice, offline)| {
-                // Not a warning box (v0.2.12 feedback: the amber Notice read
-                // as an error and flashed on every blip — pre-grace). One
-                // quiet caption line, amber dot only for hard offline; it
-                // clears itself the moment the path heals.
-                let dot = if offline {
-                    theme.warning
-                } else {
-                    theme.text_faint
-                };
-                el.child(crate::motion::fade_in(
-                    "composer-queue-notice",
-                    div()
-                        .id("composer-queue-notice")
-                        .mx(px(8.0))
-                        .mt(px(6.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .text_size(px(11.0))
-                        .line_height(px(14.0))
-                        .text_color(theme.text_faint)
-                        .child(div().size(px(5.0)).rounded_full().bg(dot))
-                        .child(div().min_w_0().truncate().child(notice)),
-                ))
             });
 
         // Turn-boundary steering notice: for agents without mid-turn
@@ -5777,7 +5570,7 @@ impl Render for Composer {
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .when(!theme.is_frost(), |el| el.shadow_lg());
+            .when(!theme.is_glass(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
