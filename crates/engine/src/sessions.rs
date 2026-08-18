@@ -1979,7 +1979,6 @@ mod tests {
             auto_approve: true,
             resume: None,
             attachments: Vec::new(),
-            worktree: None,
         }
     }
 
