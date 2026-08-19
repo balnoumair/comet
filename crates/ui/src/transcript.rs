@@ -2829,6 +2829,16 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
+            // The in-flight send's progress belongs ON the thumbnail
+            // (2026-08-18 user request). Two ref shapes mean "still
+            // crossing": the queued flow's `pending://` (bytes ship
+            // engine-side after the send; the host rewrites the ref to an
+            // absolute path once they land and the run starts) and the
+            // legacy echo's synthetic `pending/`. The local engine has no
+            // relay leg (and so no transfer percent) — the indicator is an
+            // indeterminate spinner for the short local-staging window.
+            let sending =
+                att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2854,7 +2864,14 @@ impl Transcript {
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height (gpui f8d8a90 repoint), so
+                                // size_full let a tall photo grow past the
+                                // frame and the rectangular overflow clip
+                                // squared the bottom corners (2026-08-19).
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
                                 // The IMG needs its own radii: the frame's
                                 // rounding only clips rectangularly, so the
                                 // sprite must round its own corners (7 = the
@@ -2862,6 +2879,34 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
+                        .when(sending, |el| {
+                            // The pulse read registers this entity for frames,
+                            // so the overlay stays live even once the trailer's
+                            // 30s pending-send bridge has lapsed.
+                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                                &motion::ZERON_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            ));
+                            let indicator: AnyElement = crate::loaders::mini_gradient_spinner(
+                                format!("att-sending-{row_id}-{aix}"),
+                                3.0,
+                                cx.entity_id(),
+                                cx,
+                            )
+                            .into_any_element();
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                    .child(indicator),
+                            )
+                        })
                         .into_any_element()
                 }
                 // Errored/unavailable: the dashed "missing" thumb.

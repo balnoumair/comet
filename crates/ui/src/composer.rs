@@ -3667,7 +3667,16 @@ impl Composer {
                             }))
                             .child(
                                 img(att.image.clone())
-                                    .size_full()
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the image's intrinsic aspect
+                                    // ratio over a percent height (gpui
+                                    // f8d8a90 repoint), so size_full let a
+                                    // tall photo grow past the frame — the
+                                    // rectangular overflow clip then squared
+                                    // the bottom corners (2026-08-19 report).
+                                    // 56−2 = frame minus its 1px borders.
+                                    .w(px(STRIP_THUMB - 2.0))
+                                    .h(px(STRIP_THUMB - 2.0))
                                     // Own radii — the frame's rounding only
                                     // clips rectangularly (7 = 8 - border).
                                     .rounded(px(7.0))
