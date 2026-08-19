@@ -2776,7 +2776,7 @@ impl Transcript {
         }
         let chat_id = self.chat_id.clone()?;
         let now = chrono::Utc::now();
-        let (sending, elapsed_secs, upload_pct) = {
+        let (sending, elapsed_secs) = {
             let state = self.state.read(cx);
             if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
                 // Past the pending-send TTL with no ack, the Working overlay
@@ -2812,18 +2812,12 @@ impl Transcript {
             let elapsed = turn_started
                 .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                 .unwrap_or(0);
-            (sending, elapsed, state.upload_progress_percent())
+            (sending, elapsed)
         };
-        // The attachment leg names itself with live progress — a slow upload
-        // must read as slow, never as a hang (2026-08-18 user report). The
-        // spinner repaints every frame, so the percent stays live.
         let word = if sending {
-            match upload_pct {
-                Some(pct) => format!("Uploading… {pct}%"),
-                None => "Sending…".to_string(),
-            }
+            "Sending"
         } else {
-            format!("{}…", flavour_word(flavour_seed(&chat_id), elapsed_secs))
+            flavour_word(flavour_seed(&chat_id), elapsed_secs)
         };
         let theme = Theme::of(cx).clone();
         Some(
@@ -2845,7 +2839,7 @@ impl Transcript {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(word)),
+                        .child(SharedString::from(format!("{word}…"))),
                 )
                 .when(!sending, |el| {
                     el.child(
