@@ -1,4 +1,4 @@
-name: Rust
+name: PR Quality check
 
 on:
   pull_request:
