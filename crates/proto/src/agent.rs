@@ -14,6 +14,8 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
+    /// SST's opencode agent, driven over ACP (`opencode acp`).
+    Opencode,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -256,6 +258,12 @@ pub enum AgentEvent {
         assistant_message_id: String,
     },
     TextDelta {
+        text: String,
+    },
+    /// A user-authored message in the turn stream (e.g. parent steers into a
+    /// subagent transcript). Parent-chat user entries still come from doc
+    /// commands; this variant is for nested transcript attribution.
+    UserMessage {
         text: String,
     },
     ReasoningDelta {
