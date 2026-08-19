@@ -1,0 +1,63 @@
+name: PR Quality check
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libfontconfig1-dev
+    - name: Cache Rust build artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Determine affected crates
+      id: affected
+      run: |
+        chmod +x scripts/ci-affected-crates.sh
+        mapfile -t packages < <(scripts/ci-affected-crates.sh "${{ github.event.pull_request.base.sha }}")
+        if [ "${#packages[@]}" -eq 1 ] && [ "${packages[0]}" = all ]; then
+          echo "mode=all" >> "$GITHUB_OUTPUT"
+          echo "Testing all workspace packages"
+        elif [ "${#packages[@]}" -eq 1 ] && [ "${packages[0]}" = none ]; then
+          echo "mode=none" >> "$GITHUB_OUTPUT"
+          echo "No crate changes; skipping tests"
+        else
+          echo "mode=selected" >> "$GITHUB_OUTPUT"
+          {
+            echo "packages<<EOF"
+            printf '%s\n' "${packages[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Testing packages: ${packages[*]}"
+        fi
+    - name: Run tests
+      run: |
+        if [ "${{ steps.affected.outputs.mode }}" = all ]; then
+          cargo test --verbose
+        elif [ "${{ steps.affected.outputs.mode }}" = none ]; then
+          echo "Skipped — docs-only or non-crate changes"
+        else
+          args=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] || continue
+            args+=(-p "$pkg")
+          done <<< "${{ steps.affected.outputs.packages }}"
+          cargo test "${args[@]}" --verbose
+        fi
