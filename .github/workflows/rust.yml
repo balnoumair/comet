@@ -3,6 +3,13 @@ name: Rust
 on:
   pull_request:
     branches: [ "main" ]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci-affected-crates.sh"
+      - ".github/workflows/rust.yml"
 
 env:
   CARGO_TERM_COLOR: always
