@@ -845,36 +845,6 @@ impl AppState {
         }
     }
 
-    /// Attachment upload starting: expose its progress to the working label.
-    pub fn begin_upload_progress(
-        &mut self,
-        total: u64,
-        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        self.upload_progress = Some(UploadProgress { done, total });
-    }
-
-    /// Upload leg over (success or failure) — the label goes back to plain
-    /// send/working wording.
-    pub fn end_upload_progress(&mut self) {
-        self.upload_progress = None;
-    }
-
-    /// Percent of the in-flight attachment upload, clamped to 99 — the last
-    /// point belongs to the commit + queue, so "100% but still spinning"
-    /// never shows. `None` when no upload is in flight (or it's empty).
-    pub fn upload_progress_percent(&self) -> Option<u8> {
-        let progress = self.upload_progress.as_ref()?;
-        if progress.total == 0 {
-            return None;
-        }
-        let done = progress
-            .done
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .min(progress.total);
-        Some(((done * 100) / progress.total).min(99) as u8)
-    }
-
     /// A send whose queued command is PAST the Working-overlay TTL and still
     /// unacked — almost always undelivered (the edge link is down; the queue
     /// write itself is local and instant). The overlay must stop faking
@@ -2150,32 +2120,6 @@ mod tests {
         assert!(!s.send_queued_unacked("c", later));
     }
 
-    #[test]
-    fn upload_progress_percent_clamps_and_clears() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let mut s = AppState::new();
-        assert_eq!(s.upload_progress_percent(), None);
-
-        let done = Arc::new(AtomicU64::new(0));
-        s.begin_upload_progress(1_000, done.clone());
-        assert_eq!(s.upload_progress_percent(), Some(0));
-        done.store(430, Ordering::Relaxed);
-        assert_eq!(s.upload_progress_percent(), Some(43));
-        // The last point belongs to commit+queue — never show a stuck 100%.
-        done.store(1_000, Ordering::Relaxed);
-        assert_eq!(s.upload_progress_percent(), Some(99));
-        // Overshoot (b64 padding rounding) stays clamped.
-        done.store(1_002, Ordering::Relaxed);
-        assert_eq!(s.upload_progress_percent(), Some(99));
-
-        s.end_upload_progress();
-        assert_eq!(s.upload_progress_percent(), None);
-
-        // A zero-byte total renders as plain "Sending…", not a percent.
-        s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
-        assert_eq!(s.upload_progress_percent(), None);
-    }
     #[test]
     fn send_pending_overlays_working_until_ttl() {
         let now = Utc::now();
