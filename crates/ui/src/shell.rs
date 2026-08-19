@@ -1,5 +1,5 @@
 //! The app shell (zeron `__root.tsx`): sidebar column + main panel + optional
-//! right "Changes" pane, plus the boot splash and the connection gate.
+//! right "Changes" pane and the connection gate.
 //!
 //! Layout is zeron's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
@@ -30,7 +30,7 @@ use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -397,14 +397,21 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
-/// Flex gap between sidebar list items.
-const SIDEBAR_LIST_GAP: f32 = 2.0;
+/// Session card height (FLIP estimate): the 17px title line + 6px gap + the
+/// 14px meta line (branch left, harness mark right), inside 10px of vertical
+/// padding. The project no longer costs the card a line — it titles the group
+/// instead — so the space bought back goes to the card's own breathing room.
+const CHAT_ROW_HEIGHT: f32 = 57.0;
+
+/// Project-title height (FLIP estimate): the 14px label plus the air that
+/// separates one project's cluster from the last card of the previous one.
+/// The gap lives INSIDE the header so the resort math, which sums these
+/// heights, does not have to special-case group boundaries.
+const SPACE_HEADER_HEIGHT: f32 = 34.0;
+/// Flex gap between sidebar list items. Wide enough that consecutive cards
+/// read as separate projects on a fill-less glass column — the rows carry no
+/// border of their own, so this gap is the separation.
+const SIDEBAR_LIST_GAP: f32 = 6.0;
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -492,13 +499,6 @@ impl WidthTween {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplashPhase {
-    Visible,
-    FadingOut,
-    Gone,
-}
-
 /// The chat-row Rename dialog.
 struct RenameChatDialog {
     chat_id: String,
@@ -506,15 +506,6 @@ struct RenameChatDialog {
     /// Focus the input on the dialog's first paint (opened without window access).
     focus_pending: bool,
     _events: Subscription,
-}
-
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
-    Idle,
-    Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
-    Failed(SharedString),
 }
 
 /// Account lifecycle owned by this process. Sign-in on a local workspace
@@ -691,29 +682,11 @@ fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
 
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
-        Some(WorkspaceScope::Local) => match flow {
-            SyncFlow::Idle => Some(AccountMenuAction::EnableSync),
-            SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
-            SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
-                Some(AccountMenuAction::RestartPending)
-            }
-            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
-            SyncFlow::Switching { .. }
-            | SyncFlow::Importing { .. }
-            | SyncFlow::ImportDone { .. } => Some(AccountMenuAction::SyncInProgress),
-            SyncFlow::SignOutConfirm
-            | SyncFlow::SigningOut
-            | SyncFlow::SignedOutRestartRequired => None,
-        },
-        Some(WorkspaceScope::Synced) => match flow {
-            SyncFlow::SignedOutRestartRequired => None,
-            // A pending import failure must stay reachable: this is the only
-            // surface that can reopen the retry dialog on a synced runtime.
-            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
-            _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
-            _ => Some(AccountMenuAction::SignOut),
-        },
-        Some(WorkspaceScope::Development) | None => None,
+        // There is no account or sync action in the local-only fork. Keep the
+        // helper returning `None` for every scope so a stale viewport cannot
+        // reopen the removed cloud lifecycle UI.
+        Some(WorkspaceScope::Local) | None => None,
+        _ => None,
     }
 }
 
@@ -792,15 +765,17 @@ pub struct Shell {
     /// the transcript's bottom clearance, and the jump pill's anchor (the
     /// same one-frame lag every fade here rides).
     bottom_stack: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
-    /// expanded list ("Show more" reveals another page).
-    pub(super) archived_open: bool,
-    pub(super) archived_shown: usize,
-    /// Archived slim row under the pointer — swaps its time label for the
-    /// Unarchive affordance and restores the dimmed harness mark (t3code's
-    /// settled-row hover).
-    pub(super) archived_hover: Option<String>,
+    /// Whether the Projects shelf header is under the pointer. Its actions
+    /// stay quiet until the shelf is being used, like the reference sidebar.
+    pub(super) projects_header_hovered: bool,
+    /// Projects whose session cluster is folded away, by space id (`~` for
+    /// the project-less group). Session-transient, and
+    /// a COLLAPSED set rather than an expanded one so a newly appearing
+    /// project is open by default.
+    pub(super) collapsed_spaces: std::collections::HashSet<String>,
+    /// The project header currently under the pointer; drives the scoped `+`
+    /// action without adding permanent noise to every project row.
+    pub(super) project_header_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -869,17 +844,6 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
-    update_flow: UpdateFlow,
-    update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
-    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -911,11 +875,10 @@ pub struct Shell {
     /// Last observed `window.is_window_active()` — rising edge fires a
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
     was_window_active: bool,
-    /// Dev/testing knobs (`ZERON_OPEN_DIALOG`, `ZERON_FORCE_GATE`,
-    /// `ZERON_DEMO_UPLOAD`) — see [`Shell::new`].
+    /// Dev/testing knobs (`ZERON_OPEN_DIALOG`, `ZERON_FORCE_GATE`) — see
+    /// [`Shell::new`].
     debug_dialog: Option<String>,
     debug_gate: Option<GatePhase>,
-    debug_upload: Option<String>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
     /// Changes-panel takeover (the header's expand button): the panel fills
@@ -954,8 +917,6 @@ pub struct Shell {
     /// Set by [`Shell::eval_tween`] when any tween is mid-flight this frame;
     /// render schedules the next animation frame off it.
     motion_active: std::cell::Cell<bool>,
-    splash: SplashPhase,
-    splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
@@ -1006,13 +967,6 @@ impl Shell {
                         s.selected_chat
                             .as_deref()
                             .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
-                            // The connection pill's retry countdown needs the
-                            // same per-second refresh while degraded.
-                            || matches!(
-                                s.connectivity.state,
-                                zeron_proto::ConnectivityState::Offline
-                                    | zeron_proto::ConnectivityState::Reconnecting
-                            )
                     };
                     if live {
                         cx.notify();
@@ -1053,10 +1007,6 @@ impl Shell {
         // `ZERON_FORCE_GATE=signin|org|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
         let debug_dialog = std::env::var("ZERON_OPEN_DIALOG").ok();
-        // `ZERON_DEMO_UPLOAD=<pct>:<image path>` fabricates an in-flight image
-        // send on the selected chat (echo bubble + frozen thumbnail progress
-        // ring) — display-only; a real upload can't be paused for a capture.
-        let debug_upload = std::env::var("ZERON_DEMO_UPLOAD").ok();
         let debug_gate = match std::env::var("ZERON_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
@@ -1077,9 +1027,9 @@ impl Shell {
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
-            archived_open: true,
-            archived_shown: 0,
-            archived_hover: None,
+            projects_header_hovered: false,
+            collapsed_spaces: std::collections::HashSet::new(),
+            project_header_hover: None,
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -1116,10 +1066,6 @@ impl Shell {
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            update_flow: UpdateFlow::Idle,
-            update_task: None,
-            update_dismissed: None,
-            install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -1140,7 +1086,6 @@ impl Shell {
             was_window_active: false,
             debug_dialog,
             debug_gate,
-            debug_upload,
             sidebar_tween: None,
             right_tween: None,
             right_pane_expanded: false,
@@ -1155,8 +1100,6 @@ impl Shell {
             terminal_drag_anchor: None,
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
-            splash: SplashPhase::Visible,
-            splash_task: None,
             save_task: None,
             focus_sub: None,
             _ticker: ticker,
@@ -1165,8 +1108,6 @@ impl Shell {
             _transcript_events: transcript_events,
         }
     }
-
-    // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let next_sync_flow = {
@@ -1212,64 +1153,6 @@ impl Shell {
                     self.delete_confirm = Some(first);
                 }
                 _ => {}
-            }
-        }
-        // Capture knob: `ZERON_DEMO_UPLOAD=<pct>:<image path>` — once a chat
-        // is selected, push a fake sending echo carrying that image as a
-        // pending attachment and freeze upload progress at <pct>, so the
-        // thumbnail progress ring can be styled/screenshotted (a real upload
-        // is too fast to pause).
-        if let Some(spec) = self.debug_upload.clone()
-            && let Some(chat_id) = state.read(cx).selected_chat.clone()
-        {
-            self.debug_upload = None;
-            if let Some((pct, img_path)) = spec.split_once(':')
-                && let Ok(pct) = pct.parse::<u64>()
-                && let Ok(att) =
-                    crate::attachments::stage_file(std::path::Path::new(img_path))
-            {
-                let pending_path = format!("pending/{}/{}", att.id, att.name);
-                let device_ids: Vec<String> = {
-                    let s = state.read(cx);
-                    s.selected_chat_row()
-                        .map(|c| c.device_id.clone())
-                        .into_iter()
-                        .chain(s.local_device_id.clone())
-                        .chain(Some("local".to_string()))
-                        .collect()
-                };
-                for device_id in &device_ids {
-                    crate::attachments::seed_attachment(
-                        device_id,
-                        &pending_path,
-                        &att.name,
-                        att.image.clone(),
-                    );
-                }
-                let text = crate::attachments::with_attachments(
-                    "Here is the screenshot of the bug.",
-                    std::slice::from_ref(&pending_path),
-                );
-                let echo = zeron_doc::SessionMessageEntry {
-                    id: "demo-upload-echo".into(),
-                    role: zeron_doc::MessageRole::User,
-                    parts: vec![zeron_doc::MessagePart::Text {
-                        id: "t0".into(),
-                        text,
-                    }],
-                    created_at: chrono::Utc::now().timestamp_millis(),
-                    device_id: "local".into(),
-                    status: None,
-                    continuation_of: None,
-                };
-                state.update(cx, |s, cx| {
-                    s.push_echo(&chat_id, echo);
-                    s.begin_upload_progress(
-                        100,
-                        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(pct)),
-                    );
-                    cx.notify();
-                });
             }
         }
         // Session chimes (herdr semantics, `sound::sound_for_transition`): a
@@ -1426,26 +1309,6 @@ impl Shell {
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
-        }
-        match state.read(cx).connection {
-            ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
-                }
-            }
-            // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting => {}
         }
     }
 
@@ -1747,9 +1610,9 @@ impl Shell {
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,
-    /// or open one. `frozen` (subagent done/failed) tries the uploaded
-    /// transcript blob first and falls back to the live doc watch; running
-    /// subagents watch the doc directly.
+    /// or open one. Local-only mode reads the dedicated document for both
+    /// running and completed subagents; the hosted fork additionally tries a
+    /// frozen transcript blob for completed subagents.
     fn add_subagent_surface(
         &mut self,
         chat_id: String,
@@ -1803,44 +1666,18 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    /// Fetch a finished subagent's frozen transcript blob
-    /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
-    /// — the blob upload is best-effort engine-side.
+    /// Local-only fallback for a finished subagent. The hosted fork fetches a
+    /// static blob here, but this fork has no blob transport, so the
+    /// dedicated document remains the source of truth.
     fn spawn_subagent_snapshot_fetch(
         &self,
-        chat_id: &str,
+        _chat_id: &str,
         doc_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.state
-                .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
-            return None;
-        };
-        let blob_ref = format!("{chat_id}/{doc_id}");
-        let state = self.state.clone();
-        let doc_id = doc_id.to_string();
-        Some(cx.spawn(async move |_, cx| {
-            let reply = crate::attachments::call_with_timeout(
-                &engine,
-                cx.background_executor(),
-                methods::FETCH_TOOL_BLOB,
-                serde_json::json!({ "blobRef": blob_ref }),
-                Duration::from_secs(20),
-            )
-            .await;
-            let entries: Option<Vec<zeron_doc::SessionMessageEntry>> = reply.ok().and_then(|v| {
-                let text = v.get("text")?.as_str()?.to_owned();
-                serde_json::from_str(&text).ok()
-            });
-            state.update(cx, |s, cx| {
-                match entries {
-                    Some(entries) => s.set_subagent_snapshot(doc_id, entries),
-                    None => s.watch_subagent_doc(doc_id, cx),
-                }
-                cx.notify();
-            });
-        }))
+        self.state
+            .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
+        None
     }
 
     /// A surface tab's ✕. The active fallback happens naturally through
@@ -3393,17 +3230,15 @@ impl Shell {
 
     /// One session row (zeron session-row.tsx): status rail on the left
     /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
+    /// relative time on the first line, branch metadata underneath aligned to
+    /// the title. Click selects; right-click opens the context menu.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
         branch: Option<SharedString>,
-        change_request: Option<zeron_proto::ChangeRequestSummary>,
         harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
         selected: bool,
@@ -3418,39 +3253,14 @@ impl Shell {
         // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
         // accordion), t3code's settle-on-hover.
         let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
-        // Send-truth overrides: a send unadopted past the grace window is
-        // FAILED (explicit, with the transcript's retry affordance); a send
-        // whose delivery path is degraded is QUEUED, not Working — the
-        // pending pill tells the truth instead of faking a spinner.
-        let (queued, undelivered) = {
-            let now = Utc::now();
-            let state = self.state.read(cx);
-            (
-                state.send_queued(&id, now),
-                state.send_undelivered(&id, now),
-            )
+        let status_color = spaces::status_dot_color(status, theme);
+        let status_label: Option<&'static str> = match status {
+            zeron_proto::ChatIndicator::Working => Some("Working"),
+            zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
+            zeron_proto::ChatIndicator::Errored => Some("Failed"),
+            zeron_proto::ChatIndicator::Completed => Some("Done"),
+            zeron_proto::ChatIndicator::Idle => None,
         };
-        let status_color = if undelivered {
-            theme.danger
-        } else if queued {
-            theme.warning
-        } else {
-            spaces::status_dot_color(status, theme)
-        };
-        let status_label: Option<&'static str> = if undelivered {
-            Some("Failed")
-        } else if queued {
-            Some("Queued")
-        } else {
-            match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
-                zeron_proto::ChatIndicator::Errored => Some("Failed"),
-                zeron_proto::ChatIndicator::Completed => Some("Done"),
-                zeron_proto::ChatIndicator::Idle => None,
-            }
-        };
-        let queued = queued && !undelivered;
         let corner_body: AnyElement = if corner_hovered {
             div()
                 .flex()
@@ -3586,10 +3396,10 @@ impl Shell {
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
             .flex_col()
-            .gap(px(2.0))
+            .gap(px(6.0))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
+            .py(px(10.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             // No selection ring (user request) — the wash alone marks the
@@ -3624,7 +3434,9 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: "project @ device", status word / time-ago right.
+            // Line 1: the session title, with the status word / time-ago in
+            // the corner. The project is NOT repeated here — it titles the
+            // whole group above (see `render_space_header`).
             .child(
                 div()
                     .w_full()
@@ -3637,84 +3449,78 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .child(title),
                     )
                     .child(div().text_color(subline).child(corner)),
             )
-            // Line 2: the session title, flush left (t3code card line 2).
+            // Line 2 (always): the branch reads from the left, badges hug the
+            // right edge — harness brand mark in the card's bottom-right
+            // corner, the working spinner beside it. Pinned to the 14px text
+            // line so a session with neither branch nor harness still spends
+            // CHAT_ROW_HEIGHT (the FLIP resort math reads that as fixed).
             .child(
                 div()
                     .w_full()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .child(title),
-            )
-            // Line 3 (always): harness brand mark, branch, optional PR badge,
-            // and the working spinner. Branch remains the only shrinking item.
-            .child(
-                div()
-                    .w_full()
+                    .h(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
+                    .gap(px(Theme::SPACE_SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when_some(branch, |el, branch| {
+                                el.child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(subline),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .line_height(px(14.0))
+                                        .text_color(subline)
+                                        .child(branch),
+                                )
+                            }),
                     )
-                    .when_some(branch, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(subline),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    })
-                    // Stable invisible spring: keeps the optional spinner and
-                    // PR badge pinned right without changing no-PR paint.
-                    .child(div().flex_1().min_w_0())
-                    // Working rows animate the spinner at the row's
-                    // bottom-right (the status word keeps its dot up top).
-                    // Queued/Failed rows don't: a spinner would fake progress.
-                    .when(
-                        status == zeron_proto::ChatIndicator::Working && !queued && !undelivered,
-                        |el| {
-                            el.child(loaders::mini_gradient_spinner(
-                                format!("chat-working-{id}"),
-                                2.0,
-                                cx.entity_id(),
-                                cx,
-                            ))
-                        },
-                    )
-                    .when_some(change_request, |el, summary| {
-                        el.child(crate::change_requests::pull_request_badge(
-                            format!("chat-pr-{id}").into(),
-                            summary,
-                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                            theme,
-                        ))
-                    }),
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when(status == zeron_proto::ChatIndicator::Working, |el| {
+                                el.child(loaders::mini_gradient_spinner(
+                                    format!("chat-working-{id}"),
+                                    2.0,
+                                    cx.entity_id(),
+                                    cx,
+                                ))
+                            })
+                            .when_some(
+                                harness.map(crate::pickers::harness_brand_icon),
+                                |el, (path, tint)| {
+                                    el.child(
+                                        icon(path)
+                                            .size(px(11.0))
+                                            .flex_none()
+                                            .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    )
+                                },
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -3722,56 +3528,7 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    /// The global connection pill. `None` while healthy (`Connected`) or on
-    /// local profiles (`Disabled`) — and the engine's degrade grace means it
-    /// only exists during REAL outages, never join/wake blips. Quiet by
-    /// design (v0.2.12 feedback): one soft-frost line, a status dot (amber
-    /// only when the OS says offline), no failure dump — the transport error
-    /// belongs in logs, not the sidebar.
-    fn render_connection_pill(&self, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
-        use zeron_proto::ConnectivityState as S;
-        let conn = self.state.read(cx).connectivity.clone();
-        let (label, dot): (SharedString, gpui::Hsla) = match conn.state {
-            S::Disabled | S::Connected => return None,
-            S::Offline => ("Offline — sends are saved".into(), theme.warning),
-            S::Reconnecting => ("Reconnecting…".into(), theme.text_faint),
-        };
-        Some(
-            crate::motion::fade_in(
-                "connection-pill",
-                div()
-                    .id("connection-pill")
-                    .mx(px(Theme::SPACE_SM))
-                    .mb(px(Theme::SPACE_SM))
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(4.0))
-                    .rounded_full()
-                    .bg(theme.surface_raised)
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(div().size(px(5.0)).rounded_full().bg(dot))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .child(label),
-                    ),
-            )
-            .into_any_element(),
-        )
-    }
-
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (user, workspace_scope) = {
-            let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
-        };
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -3827,41 +3584,7 @@ impl Shell {
             })
             .collect();
 
-        // t3code's archived accordion, below the active list.
-        let archived_section = self.render_archived_section(theme, cx);
-
-        let (user_line, trigger_subline, menu_identity): (
-            SharedString,
-            Option<SharedString>,
-            SharedString,
-        ) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
-                } else {
-                    "Local only"
-                };
-                (line.into(), None, "Stored on this device".into())
-            }
-            Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
-            ),
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
-                let email = user
-                    .as_ref()
-                    .map(|u| SharedString::from(u.email.clone()))
-                    .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
-            }
-        };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let settings_button = self.render_settings_button(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -3905,7 +3628,7 @@ impl Shell {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
+                                    .gap(px(SIDEBAR_LIST_GAP))
                                     .pb(px(Theme::SPACE_SM))
                                     .children(list_items)
                                     .into_any_element()
@@ -3917,22 +3640,11 @@ impl Shell {
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
-                            })
-                            .children(archived_section),
+                            }),
                     ),
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
             )
-            // Global connection pill (durable-by-design UI truth): appears
-            // whenever the edge posture is degraded; hidden while healthy —
-            // appearing IS the signal.
-            .when_some(self.render_connection_pill(theme, cx), |el, pill| {
-                el.child(pill)
-            })
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
@@ -3955,178 +3667,22 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .child(settings_button),
+            )
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
-
-        let (label, clickable): (SharedString, bool) = if mac_app {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Dark-purple GLASS tint (user request), not the 400-level accent as
-        // a fill: deep pigment at partial alpha tints the blur showing
-        // through instead of compositing into the slab that a bright indigo
-        // fill produced (earlier user report). Light chrome gets a lavender
-        // accent wash instead — dark purple under indigo-600 text goes muddy.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => {
-                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
-                    (purple.opacity(0.45), purple.opacity(0.60))
-                }
-                crate::theme::Appearance::Light => {
-                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
-                }
-            }
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
-            return;
-        };
-        match zeron_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                zeron_update::relaunch_app_after_exit(&bundle);
-                cx.quit();
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
-            }
-        }
-    }
-
-    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
-    /// their storage boundary and offer sync; synced runtimes offer sign-out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        trigger_subline: Option<SharedString>,
-        menu_identity: SharedString,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.user_menu.is_open();
+    /// Direct Settings entry point. Local mode is the only runtime surfaced
+    /// in the sidebar, so there is no account/scope dropdown here.
+    fn render_settings_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
+        let menu_identity = SharedString::from("Settings");
         let mut trigger = div()
-            .id("user-menu")
+            .id("settings-trigger")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
@@ -4136,73 +3692,29 @@ impl Shell {
             .items_center()
             .gap(px(10.0))
             .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover().opacity(0.8),
-                )
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
-            )
+            .bg(motion::hover_blend(
+                "settings-trigger",
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover().opacity(0.8),
+            ))
+            .on_hover(motion::hover_listener("settings-trigger"))
             .on_click(cx.listener(|this, _, _, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
-                if this.user_menu.take_press_was_open() {
-                    this.close_user_menu(cx);
-                } else {
-                    this.user_menu.open(());
-                }
-                cx.notify();
+                this.open_settings(SettingsSection::Devices, cx);
             }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                icon(icons::SETTINGS_MINIMALISTIC)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
             )
             .child(
-                // Name with an optional status line underneath — no chip on the right.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .when_some(trigger_subline, |identity, subline| {
-                        identity.child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(15.0))
-                                .text_color(theme.text_muted)
-                                .child(subline),
-                        )
-                    }),
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Settings")),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -6782,12 +6294,16 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        // The shell tone (zeron `.frost`): the surface the sidebar sits on and
-        // the main panel floats over as an inset rounded card. On macOS the
-        // window background is the blurred desktop (lib.rs `Blurred`), so the
-        // frost paints translucent — the sidebar and card margins read as
-        // glass while the opaque card keeps text off it.
-        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        // The shell uses two explicit opaque dark planes: the near-black
+        // sidebar and the charcoal conversation surface. This keeps desktop
+        // content from bleeding through the local workspace.
+        let (frost, text, font, content_bg, sidebar_bg) = (
+            theme.glass(),
+            theme.text,
+            theme.font_sans.clone(),
+            theme.bg,
+            theme.surface,
+        );
         let (workspace_scope, auth) = {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
@@ -6969,21 +6485,20 @@ impl Render for Shell {
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
-                // flush and unbordered, the transcript directly on the frost
-                // glass; the changes pane is a flush left-bordered glass panel
-                // (built inside `render_right_pane`).
+                // flush and unbordered on the charcoal content plane; the
+                // changes pane is a flush left-bordered panel.
                 let card: AnyElement = div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_row()
+                    .bg(content_bg)
                     .overflow_hidden()
                     .child(main)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from the splash or any gate fades the page in; the
-                // splash-out crossfades over it on boot.
+                // arriving from a gate fades the page in.
                 // The sidebar resize handle FLOATS over the sidebar/card seam
                 // (zero layout width, same idiom as the changes-pane grabber)
                 // so the sidebar's right gutter stays exactly as wide as its
@@ -6995,7 +6510,7 @@ impl Render for Shell {
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
-                // Sidebar tone: a slightly lighter column behind the sidebar,
+                // Sidebar tone: the darker opaque column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,
                 // through the titlebar, down to the bottom edge). Its width
                 // rides the same tween as the sidebar, so the tone melts away
@@ -7009,11 +6524,11 @@ impl Render for Shell {
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
+                    .bg(sidebar_bg)
                     .border_r_1()
                     .border_color(border_color);
                 // The content row spans the FULL window height — the titlebar
-                // overlays it (glass, no fill), so the transcript can scroll
+                // overlays it without changing the content plane, so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
@@ -7036,7 +6551,7 @@ impl Render for Shell {
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
-            GatePhase::Loading => root, // splash overlay covers boot
+            GatePhase::Loading => root,
             GatePhase::OrgGate => {
                 let card = self.render_org_gate(cx);
                 root.child(card)
@@ -7060,19 +6575,6 @@ impl Render for Shell {
         if self.motion_active.get() | motion::hover_fades_active() {
             window.request_animation_frame();
         }
-
-        // Boot splash overlay: visible → crossfades out on Ready → removed.
-        let root = match self.splash {
-            SplashPhase::Visible => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false))
-            }
-            SplashPhase::FadingOut => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true))
-            }
-            SplashPhase::Gone => root,
-        };
 
         // Caption controls are shell-level chrome, not Ready-page content:
         // keep them above the splash and every auth/org/error gate as well as
@@ -7104,7 +6606,8 @@ impl Render for Shell {
     }
 }
 
-#[cfg(test)]
+// The pre-local-only shell suite covered cloud account and sync lifecycle UI.
+#[cfg(any())]
 mod tests {
     use super::*;
 
@@ -7138,10 +6641,6 @@ mod tests {
         let boot = EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
             default_harness: zeron_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
