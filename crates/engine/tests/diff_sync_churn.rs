@@ -51,7 +51,6 @@ fn assemble(dir: &Path) -> EngineCore {
         dir,
         Arc::new(HarnessRegistry::new()),
         zeron_proto::HarnessId::Mock,
-        None,
     )
     .expect("engine assembles")
 }
@@ -178,7 +177,6 @@ async fn chat_flap_keeps_entry_and_sustained_absence_removes_it() {
         core.repos.clone(),
         core.workspace.clone(),
         &core.device_id,
-        None,
         Duration::from_millis(300),
     );
     core.workspace
@@ -251,7 +249,6 @@ async fn deleted_checkout_is_evicted_after_grace() {
         core.repos.clone(),
         core.workspace.clone(),
         &core.device_id,
-        None,
         Duration::from_millis(300),
     );
     core.workspace
