@@ -601,7 +601,7 @@ impl AgentAccounts {
         if let Some(noop_browser) = ensure_noop_browser(&self.inner.config.root_dir()) {
             command.env("BROWSER", noop_browser);
         }
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&home);
