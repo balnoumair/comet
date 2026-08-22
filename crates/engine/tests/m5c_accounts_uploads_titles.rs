@@ -694,12 +694,17 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("dispatch");
 
     // The mock's scripted reply doubles as the titling model's output.
-    let chat = wait_for("chat title", || {
+    // Wait for title *and* branch: titling renames the worktree before
+    // `rename_chat`, so both should land together once generate finishes.
+    let chat = wait_for("chat title + branch", || {
         core.workspace
             .chat(chat_id)
             .ok()
             .flatten()
-            .filter(|c| c.title.as_deref().is_some_and(|t| !t.is_empty()))
+            .filter(|c| {
+                c.title.as_deref() == Some("Fix Login Flow")
+                    && c.branch.as_deref() == Some("zeron/fix-login-flow")
+            })
     })
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));

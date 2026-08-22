@@ -1110,8 +1110,14 @@ impl AgentAccounts {
             }
         }
         // Creation order — stable across switches (saved_at churns on every
-        // auto-snapshot; created_at never does).
-        slots.sort_by_key(|s| s.created_at.unwrap_or(s.saved_at));
+        // auto-snapshot; created_at never does). account_key breaks ties for
+        // legacy slots that share a millisecond.
+        slots.sort_by(|a, b| {
+            let a_at = a.created_at.unwrap_or(a.saved_at);
+            let b_at = b.created_at.unwrap_or(b.saved_at);
+            a_at.cmp(&b_at)
+                .then_with(|| a.account_key.cmp(&b.account_key))
+        });
         slots
     }
 
@@ -1123,10 +1129,27 @@ impl AgentAccounts {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
         let mut full = slot.clone();
-        full.created_at = existing
-            .and_then(|e| e.created_at.or(Some(e.saved_at)))
-            .or(slot.created_at)
-            .or(Some(slot.saved_at));
+        if let Some(e) = existing {
+            // Preserve the first-seen stamp so activate/list reshuffles never
+            // reorder cards.
+            full.created_at = e
+                .created_at
+                .or(Some(e.saved_at))
+                .or(slot.created_at)
+                .or(Some(slot.saved_at));
+        } else {
+            // New slot: keep wall-clock time, but never collide with a peer's
+            // created_at (same-ms writes used to make sort order filesystem-
+            // dependent and flake CI).
+            let now = slot.created_at.unwrap_or(slot.saved_at);
+            let max_peer = self
+                .read_slots(slot.harness)
+                .into_iter()
+                .filter_map(|s| s.created_at.or(Some(s.saved_at)))
+                .max()
+                .unwrap_or(0);
+            full.created_at = Some(now.max(max_peer.saturating_add(1)));
+        }
         let json = serde_json::to_string_pretty(&full)
             .map_err(|e| EngineError::Other(format!("serialize slot: {e}")))?;
         // Atomic + 0600 from birth: tokens must never be world-readable, and a
