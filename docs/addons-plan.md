@@ -2,6 +2,12 @@
 
 Status: design only — nothing implemented yet. Decided in conversation 2026-08-17.
 
+**Update 2026-08-22:** the product UI and `zeron` binary live in the
+[zeron](https://github.com/balnoumair/zeron) repo; GPUI design-system pieces live
+in [onyx-ui](https://github.com/balnoumair/onyx-ui). Comet is backend-only
+(`proto`/`doc`/`sync`/`harness`/`engine`/`rpc`). Paths below that say
+`crates/ui` or `apps/zeron` mean the corresponding crates in the zeron repo.
+
 Goal: keep a super-simple base app (what comet is today) and build every extra
 feature as a clearly separated add-on, removable without trace, while staying
 able to selectively cherry-pick upstream changes into the base.

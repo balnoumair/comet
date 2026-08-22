@@ -34,23 +34,17 @@ path_to_pkg() {
     crates/harness) echo zeron-harness ;;
     crates/engine) echo zeron-engine ;;
     crates/rpc) echo zeron-rpc ;;
-    crates/ui) echo zeron-ui ;;
-    crates/syntax) echo zeron-syntax ;;
-    apps/zeron) echo zeron ;;
   esac
 }
 
 dependents() {
   case "$1" in
-    zeron-proto) echo zeron-doc zeron-harness zeron-rpc zeron-engine zeron-ui zeron ;;
-    zeron-doc) echo zeron-rpc zeron-engine zeron-ui zeron ;;
-    zeron-sync) echo zeron-engine zeron-ui zeron ;;
-    zeron-harness) echo zeron-engine zeron-ui zeron ;;
-    zeron-rpc) echo zeron-engine zeron-ui zeron ;;
-    zeron-syntax) echo zeron-ui zeron ;;
-    zeron-engine) echo zeron-ui zeron ;;
-    zeron-ui) echo zeron ;;
-    zeron) ;;
+    zeron-proto) echo zeron-doc zeron-harness zeron-rpc zeron-engine ;;
+    zeron-doc) echo zeron-rpc zeron-engine ;;
+    zeron-sync) echo zeron-engine ;;
+    zeron-harness) echo zeron-engine ;;
+    zeron-rpc) echo zeron-engine ;;
+    zeron-engine) ;;
   esac
 }
 
@@ -61,9 +55,6 @@ paths=(
   crates/harness
   crates/engine
   crates/rpc
-  crates/ui
-  crates/syntax
-  apps/zeron
 )
 
 touched=()
