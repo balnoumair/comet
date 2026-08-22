@@ -116,7 +116,6 @@ async fn opencode_stall_hint_names_the_provider() {
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
         attachments: Vec::new(),
-        worktree: None,
         resume: None,
     };
     let harness = AcpHarness::opencode().with_executable(fixture_path());

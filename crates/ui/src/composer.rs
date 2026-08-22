@@ -3667,7 +3667,16 @@ impl Composer {
                             }))
                             .child(
                                 img(att.image.clone())
-                                    .size_full()
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the image's intrinsic aspect
+                                    // ratio over a percent height (gpui
+                                    // f8d8a90 repoint), so size_full let a
+                                    // tall photo grow past the frame — the
+                                    // rectangular overflow clip then squared
+                                    // the bottom corners (2026-08-19 report).
+                                    // 56−2 = frame minus its 1px borders.
+                                    .w(px(STRIP_THUMB - 2.0))
+                                    .h(px(STRIP_THUMB - 2.0))
                                     // Own radii — the frame's rounding only
                                     // clips rectangularly (7 = 8 - border).
                                     .rounded(px(7.0))
@@ -3939,10 +3948,9 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
-            .w(px(380.0))
-            .id("file-mention-list")
-            .max_h(px(280.0))
-            .overflow_y_scroll()
+            .w_full()
+            .max_h(px(320.0))
+            .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -3977,24 +3985,20 @@ impl Composer {
         } else {
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
-                let path = result.path.clone();
-                let tooltip_path: SharedString = path.clone().into();
+                let (directory, name) = match result.path.rsplit_once('/') {
+                    Some((directory, name)) => (directory.to_string(), name.to_string()),
+                    None => (String::new(), result.path.clone()),
+                };
                 card = card.child(
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| MentionPathTooltip {
-                                path: tooltip_path.clone(),
-                                activation: ix as u64,
-                            })
-                            .into()
-                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.mention.active = Some(ix);
                             this.accept_mention(cx);
                         }))
                         .child(
                             div()
+                                .w_full()
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -4006,32 +4010,34 @@ impl Composer {
                                         crate::icons::DOCUMENT
                                     })
                                     .size(px(14.0))
+                                    .flex_none()
                                     .text_color(theme.text_muted),
                                 )
                                 .child(
                                     div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .truncate()
-                                        .text_size(px(12.5))
+                                        .flex_none()
+                                        .text_size(px(13.0))
                                         .text_color(theme.text)
-                                        .child(path),
-                                ),
+                                        .child(name),
+                                )
+                                .when(!directory.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.text_muted)
+                                            .child(directory),
+                                    )
+                                }),
                         ),
                 );
             }
         }
-        let anchor = self
-            .input
-            .read(cx)
-            .visible_point_for_index(token.range.start)?;
-        // No exit phase: the completion popup tracks the token under the
-        // caret — a fade-out on every keystroke-driven dismissal would read
-        // as input lag, not polish.
-        Some(crate::popover::anchored_menu_above_at(
+        Some(crate::popover::full_width_menu_above(
             "file-mention-popup",
-            anchor,
             card.into_any_element(),
             None,
         ))
@@ -4041,7 +4047,6 @@ impl Composer {
         div()
             .relative()
             .child(self.input.clone())
-            .children(self.render_file_mention_popup(theme, cx))
             .children(self.render_slash_popup(theme, cx))
     }
 
@@ -4468,13 +4473,18 @@ impl Composer {
         )
     }
 
-    /// New-chat sends need a project: with none picked (empty device, or a
-    /// selection healed away) the send button dims and submit is a no-op —
-    /// project-less `~`-cwd sessions are no longer mintable from the canvas.
-    /// Existing chats carry their own project, so they always send.
+    /// New-chat sends need a project and a runnable agent. If either selection
+    /// is missing, the send button dims and submit is a no-op. Existing chats
+    /// carry both in their persisted state, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
-        let state = self.state.read(cx);
-        state.selected_chat.is_none() && state.selected_space_row().is_none()
+        let (is_new, no_space) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_chat.is_none(),
+                state.selected_space_row().is_none(),
+            )
+        };
+        is_new && (no_space || self.pickers.read(cx).resolved(cx).harness.is_none())
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
@@ -5310,8 +5320,8 @@ impl Composer {
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Steer => {
-                // Dimmed and inert while no project is picked (`send_blocked`
-                // also gates `on_submit`, so Enter is a no-op too).
+                // Dimmed and inert while a new chat has no project or runnable
+                // agent (`send_blocked` also gates Enter).
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
@@ -5755,11 +5765,16 @@ impl Render for Composer {
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(crate::frost::frosted(
-            26.0,
-            16.0,
-            motion::fade_quick("composer-input", body),
-        ));
+        let container = container.child(
+            div()
+                .relative()
+                .child(crate::frost::frosted(
+                    26.0,
+                    16.0,
+                    motion::fade_quick("composer-input", body),
+                ))
+                .children(self.render_file_mention_popup(&theme, cx)),
+        );
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.

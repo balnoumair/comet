@@ -33,9 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
+    Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas,
+    div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
@@ -60,6 +61,12 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
+/// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
+/// smooth enough to track text while avoiding a permanent animation-frame loop
+/// on low-end devices.
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
+const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
+const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -73,6 +80,35 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
+
+/// Signed list scroll step for a pointer near a viewport edge.
+///
+/// GPUI list offsets increase toward the document bottom. The quadratic ramp
+/// keeps entry into the edge zone gentle and reaches full speed at the edge.
+fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
+    let height = f32::from(bounds.size.height);
+    if height <= 0.0 {
+        return 0.0;
+    }
+    let edge = SELECTION_SCROLL_EDGE_PX.min(height / 3.0);
+    if edge <= 0.0 {
+        return 0.0;
+    }
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.top());
+    let bottom = f32::from(bounds.bottom());
+    let scaled = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        SELECTION_SCROLL_MAX_STEP_PX * t * t
+    };
+    if y < top + edge {
+        -scaled(top + edge - y)
+    } else if y > bottom - edge {
+        scaled(y - (bottom - edge))
+    } else {
+        0.0
+    }
+}
 const CHIPS_TOP_PAD: f32 = 2.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
@@ -1479,6 +1515,11 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    /// Last pointer sample while markdown selection owns a left-button drag.
+    selection_drag_position: Option<Point<Pixels>>,
+    /// One-shot timer rescheduled only while the pointer remains in an edge
+    /// zone. Dropping it on mouse-up stops all selection scroll work.
+    selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Height of the shell's composer/status/terminal stack overlaying the
@@ -1640,6 +1681,8 @@ impl Transcript {
             spring_kick: false,
             spring_scheduled: false,
             scroll_anim: None,
+            selection_drag_position: None,
+            selection_scroll_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
@@ -1845,6 +1888,93 @@ impl Transcript {
             })
             .ok();
         });
+    }
+
+    fn on_selection_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() || !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        self.selection_drag_position = Some(event.position);
+        if render::update_drag_at(event.position) {
+            cx.notify();
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn on_selection_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_selection_scroll();
+        if let Some(_text) = crate::markdown::selection::end_active_drag() {
+            // X11 middle-click paste parity, including the case where the
+            // anchor row has virtualized away and cannot receive mouse-up.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(_text));
+        }
+    }
+
+    fn stop_selection_scroll(&mut self) {
+        self.selection_drag_position = None;
+        self.selection_scroll_task = None;
+    }
+
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() || !crate::markdown::selection::is_dragging() {
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        if selection_scroll_step(self.list.viewport_bounds(), position) == 0.0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |transcript, cx| {
+                transcript.selection_scroll_task = None;
+                transcript.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        let step = selection_scroll_step(self.list.viewport_bounds(), position);
+        if step == 0.0 {
+            return;
+        }
+
+        // Resolve against the registry painted after the previous step before
+        // moving it again. This is what lets a stationary edge pointer consume
+        // successive virtualized rows.
+        render::update_drag_at(position);
+        self.scroll_anim = None;
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.list.scroll_by(px(step));
+        self.last_scroll_distance = self.distance_from_bottom();
+        self.show_jump_button = self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX;
+        cx.notify();
+        self.schedule_selection_scroll(cx);
     }
 
     /// Reserve the reply's space below a locally-sent prompt — EVERY send,
@@ -2699,6 +2829,16 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
+            // The in-flight send's progress belongs ON the thumbnail
+            // (2026-08-18 user request). Two ref shapes mean "still
+            // crossing": the queued flow's `pending://` (bytes ship
+            // engine-side after the send; the host rewrites the ref to an
+            // absolute path once they land and the run starts) and the
+            // legacy echo's synthetic `pending/`. The local engine has no
+            // relay leg (and so no transfer percent) — the indicator is an
+            // indeterminate spinner for the short local-staging window.
+            let sending =
+                att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2724,7 +2864,14 @@ impl Transcript {
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height (gpui f8d8a90 repoint), so
+                                // size_full let a tall photo grow past the
+                                // frame and the rectangular overflow clip
+                                // squared the bottom corners (2026-08-19).
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
                                 // The IMG needs its own radii: the frame's
                                 // rounding only clips rectangularly, so the
                                 // sprite must round its own corners (7 = the
@@ -2732,6 +2879,34 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
+                        .when(sending, |el| {
+                            // The pulse read registers this entity for frames,
+                            // so the overlay stays live even once the trailer's
+                            // 30s pending-send bridge has lapsed.
+                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                                &motion::ZERON_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            ));
+                            let indicator: AnyElement = crate::loaders::mini_gradient_spinner(
+                                format!("att-sending-{row_id}-{aix}"),
+                                3.0,
+                                cx.entity_id(),
+                                cx,
+                            )
+                            .into_any_element();
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                    .child(indicator),
+                            )
+                        })
                         .into_any_element()
                 }
                 // Errored/unavailable: the dashed "missing" thumb.
@@ -4344,6 +4519,9 @@ impl Render for Transcript {
             .relative()
             .size_full()
             .min_h_0()
+            .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
@@ -4375,6 +4553,24 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use zeron_doc::MessagePart;
+
+    #[test]
+    fn selection_scroll_ramps_at_viewport_edges() {
+        let bounds = Bounds::new(
+            gpui::point(px(10.0), px(20.0)),
+            gpui::size(px(300.0), px(200.0)),
+        );
+        assert_eq!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(120.0))),
+            0.0
+        );
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(20.0))) < 0.0);
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0))) > 0.0);
+        assert!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0)))
+                > selection_scroll_step(bounds, gpui::point(px(20.0), px(200.0)))
+        );
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 
