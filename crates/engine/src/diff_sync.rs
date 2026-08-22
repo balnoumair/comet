@@ -592,12 +592,21 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
 
     // chat.branch upkeep — the git-dir watcher covers HEAD, so every snapshot
     // reconciles mismatched rows (repair tick covers dropped events).
-    let chats = lock(&entry.chats).clone();
-    for chat in &chats {
-        if chat.branch.as_deref() != Some(snapshot.branch.as_str())
-            && let Err(err) = inner.workspace.set_chat_branch(&chat.id, &snapshot.branch)
-        {
-            tracing::debug!(chat = %chat.id, error = %err, "diff-sync: branch write failed");
+    //
+    // Re-read HEAD at apply time: a capture that started before an automatic
+    // title rename (`git branch -m`) can finish afterward with a stale
+    // `snapshot.branch` and would otherwise stomp the renamed value. If the
+    // live read fails, skip upkeep rather than writing the stale snapshot.
+    if let Ok(branch_to_write) = inner.repos.current_branch(&entry.identity.root).await
+        && !branch_to_write.is_empty()
+    {
+        let chats = lock(&entry.chats).clone();
+        for chat in &chats {
+            if chat.branch.as_deref() != Some(branch_to_write.as_str())
+                && let Err(err) = inner.workspace.set_chat_branch(&chat.id, &branch_to_write)
+            {
+                tracing::debug!(chat = %chat.id, error = %err, "diff-sync: branch write failed");
+            }
         }
     }
 

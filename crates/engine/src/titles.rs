@@ -16,7 +16,8 @@
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::StreamExt;
 
@@ -35,10 +36,23 @@ use crate::workspace_host::WorkspaceHost;
 /// couple of times with a short backoff before falling back (zeron's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
+/// `git branch -m` can lose a lock race against DiffSync's concurrent git
+/// reads; a short retry usually clears it.
+const RENAME_RETRY_DELAYS_MS: &[u64] = &[50, 150, 400];
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
+    /// Chats with a titling task already running — dispatch-time and Done-time
+    /// `maybe_generate` used to race: the loser could `rename_chat` after a
+    /// failed branch rename and leave `chat.branch` on the original
+    /// `zeron/<name>` while the title was already set.
+    inflight: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -53,6 +67,7 @@ impl TitleGenerator {
                 workspace,
                 registry,
                 repos,
+                inflight: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -72,6 +87,21 @@ impl TitleGenerator {
     }
 
     async fn generate(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        prompt: &str,
+        cwd: &str,
+    ) -> Result<(), EngineError> {
+        if !lock(&self.inner.inflight).insert(chat_id.to_string()) {
+            return Ok(()); // another titling task owns this chat
+        }
+        let result = self.generate_locked(chat_id, harness_id, prompt, cwd).await;
+        lock(&self.inner.inflight).remove(chat_id);
+        result
+    }
+
+    async fn generate_locked(
         &self,
         chat_id: &str,
         harness_id: HarnessId,
@@ -118,20 +148,33 @@ impl TitleGenerator {
         if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
             && branch.starts_with("zeron/")
         {
-            match self
-                .inner
-                .repos
-                .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, &title)
-                .await
-            {
-                Ok(renamed) if &renamed != branch => {
-                    if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
-                        tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+            let mut attempt = 0usize;
+            loop {
+                match self
+                    .inner
+                    .repos
+                    .rename_worktree_branch(std::path::Path::new(chat_cwd), branch, &title)
+                    .await
+                {
+                    Ok(renamed) if &renamed != branch => {
+                        if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed)
+                        {
+                            tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
+                        }
+                        break;
                     }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
+                    Ok(_) => break,
+                    Err(err) => {
+                        let retryable = err.to_string().contains("cannot lock ref")
+                            || err.to_string().contains("unable to resolve reference");
+                        if retryable && let Some(delay) = RENAME_RETRY_DELAYS_MS.get(attempt) {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+                            continue;
+                        }
+                        tracing::warn!(chat = %chat_id, error = %err, "automatic worktree branch rename failed");
+                        break;
+                    }
                 }
             }
         }

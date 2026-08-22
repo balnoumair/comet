@@ -1,32 +1,49 @@
-# Zeron
+# Comet
 
-Run coding agents locally with a desktop UI or a headless daemon. Sessions,
-workspace metadata, transcripts, attachments, terminals, and agent-account
-settings stay on the machine that runs Zeron.
+Backend crates for [Zeron](https://github.com/balnoumair/zeron), a
+single-machine coding-agent runtime. This repo contains no UI and no binary:
+it is a library workspace consumed by the Zeron desktop app (and any other
+host) as a set of path or git dependencies.
 
-## Run locally
+Sessions, workspace metadata, transcripts, attachments, terminals, and
+agent-account settings all stay on the machine that runs the engine. No
+account, cloud worker, sync service, or network connection is required.
 
-```bash
-cargo run -p zeron -- status
-cargo run -p zeron -- daemon start
+## Crates
+
+| Crate | Role |
+| --- | --- |
+| `zeron-proto` | Shared protocol types: sessions, views, motion math |
+| `zeron-doc` | CRDT documents (loro) for workspace and chat state |
+| `zeron-sync` | SQLite-backed local snapshots + processed-command ledger |
+| `zeron-harness` | Agent harness adapters (ACP, Claude, Codex, OpenCode, …) |
+| `zeron-engine` | Sessions, transcripts, workspace registry, repositories, terminals, uploads, harness execution |
+| `zeron-rpc` | Typed control plane over in-memory transport or localhost WebSocket IPC |
+
+## Consuming
+
+Path form, with comet checked out next to the consumer:
+
+```toml
+zeron-engine = { path = "../comet/crates/engine" }
 ```
 
-The engine stores its data under `~/.zeron` by default and exposes its local
-control plane on localhost. No account, cloud worker, sync service, or network
-connection is required to create or continue sessions.
+Git form, for CI or standalone clones:
 
-Useful commands:
-
-```bash
-zeron status
-zeron headless
-zeron daemon start|stop|restart|status
+```toml
+zeron-engine = { git = "https://github.com/balnoumair/comet", rev = "<pin>" }
 ```
 
-On macOS, the desktop UI can be built from the workspace with `cargo run -p
-zeron-ui`. The same local engine is used in-process or through the localhost
-daemon.
+The engine stores its data under `~/.zeron` by default (`ZERON_DATA_DIR` to
+override) and exposes its control plane on localhost only.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the local runtime layout.
+## Develop
+
+```bash
+cargo check --workspace
+cargo test --workspace
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime layout.
 
 Licensed under the [MIT License](LICENSE).
