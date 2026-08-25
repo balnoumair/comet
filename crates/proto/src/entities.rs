@@ -56,7 +56,7 @@ pub struct Space {
 
 impl Space {
     /// Name override, else basename(path), else the path itself.
-    /// Lives here (proto) so UI and engine agree on the derivation.
+    /// Lives here (proto) so every consumer and the engine agree on the derivation.
     pub fn display_name(&self) -> &str {
         if let Some(name) = self.name.as_deref()
             && !name.trim().is_empty()
@@ -110,7 +110,7 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
-    /// The space this chat belongs to. Invariant: `Some` for every UI-created
+    /// The space this chat belongs to. Invariant: `Some` for every host-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +147,8 @@ pub enum ChatIndicator {
 }
 
 /// Derive the display status. `live` must already be staleness-gated by the
-/// caller (the UI's 45s window) — pass `None` for a stale/absent session row.
+/// caller — see [`effective_indicator`], or pass `None` for a stale/absent
+/// session row.
 pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
     match live.map(|s| s.status) {
         Some(SessionStatus::Working) => ChatIndicator::Working,
@@ -156,6 +157,60 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
         _ if chat.unseen() => ChatIndicator::Completed,
         _ => ChatIndicator::Idle,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session staleness
+// ---------------------------------------------------------------------------
+
+/// A session's live run state once staleness has been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indicator {
+    None,
+    Working,
+    AwaitingInput,
+    Errored,
+}
+
+/// A `Working`/`AwaitingInput` session older than this is treated as dead: a
+/// crashed engine or a killed harness child must never leave a session
+/// reporting an eternal "Working". Engines heartbeat sessions well inside this
+/// window, so exceeding it means the writer is gone, not slow.
+///
+/// This is the one definition of the rule. Engine and harness code that reasons
+/// about the staleness window must reference this constant rather than
+/// restating the number.
+pub const SESSION_STALE_MS: i64 = 45_000;
+
+/// Staleness-checked run state for a session row. Pure.
+pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Indicator {
+    let Some(session) = session else {
+        return Indicator::None;
+    };
+    match session.status {
+        SessionStatus::Idle => Indicator::None,
+        SessionStatus::Errored => Indicator::Errored,
+        SessionStatus::Working | SessionStatus::AwaitingInput => {
+            let age_ms = now
+                .signed_duration_since(session.updated_at)
+                .num_milliseconds();
+            if age_ms > SESSION_STALE_MS {
+                Indicator::None
+            } else if session.status == SessionStatus::Working {
+                Indicator::Working
+            } else {
+                Indicator::AwaitingInput
+            }
+        }
+    }
+}
+
+/// The full status for a chat row: live states win, then the synced seen marker
+/// decides completed-vs-idle. Staleness gating rides on [`effective_indicator`];
+/// the derivation itself is [`chat_indicator`].
+pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
+    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
+    chat_indicator(chat, live)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
