@@ -1,22 +1,23 @@
 # Comet
 
-Backend crates for [Zeron](https://github.com/balnoumair/zeron), a
-single-machine coding-agent runtime. This repo contains no UI and no binary:
-it is a library workspace consumed by the Zeron desktop app (and any other
-host) as a set of path or git dependencies.
+Backend crates for a single-machine coding-agent runtime: sessions,
+transcripts, workspace state, repositories, terminals, uploads, and the agent
+harness adapters, behind one typed localhost RPC control plane.
 
-Sessions, workspace metadata, transcripts, attachments, terminals, and
-agent-account settings all stay on the machine that runs the engine. No
-account, cloud worker, sync service, or network connection is required.
+This repo contains no UI and no binary. It is a library workspace consumed as a
+set of path or git dependencies by whatever host drives it.
+
+Everything stays on the machine that runs the engine. No account, cloud worker,
+sync service, or network connection is required.
 
 ## Crates
 
 | Crate | Role |
 | --- | --- |
-| `zeron-proto` | Shared protocol types: sessions, views, motion math |
+| `zeron-proto` | Shared wire types and the derivations consumers must agree on |
 | `zeron-doc` | CRDT documents (loro) for workspace and chat state |
 | `zeron-sync` | SQLite-backed local snapshots + processed-command ledger |
-| `zeron-harness` | Agent harness adapters (ACP, Claude, Codex, OpenCode, …) |
+| `zeron-harness` | Agent harness adapters (ACP, Claude, Codex, OpenCode, Cursor) |
 | `zeron-engine` | Sessions, transcripts, workspace registry, repositories, terminals, uploads, harness execution |
 | `zeron-rpc` | Typed control plane over in-memory transport or localhost WebSocket IPC |
 
@@ -44,6 +45,7 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime layout.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime layout and for the rule
+on what belongs in this repo.
 
 Licensed under the [MIT License](LICENSE).

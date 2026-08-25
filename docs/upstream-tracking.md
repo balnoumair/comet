@@ -17,6 +17,16 @@ in `crates/ui`, `crates/theme`, `apps/*`, `edge/*`, `dist/*`, and packaging is
 **permanently out of scope**, not deferred. Triage only needs to look at the
 six backend crates.
 
+`crates/proto` diverged further on 2026-08-25: `proto/src/motion.rs` and
+`proto/src/view.rs` were removed. Loader motion was already duplicated in
+`onyx-ui` (`crates/onyx-ui/src/motion_math.rs`), and the viewport derivations
+moved to `zeron-ui` (`crates/zeron-ui/src/view.rs`). Only the session-staleness
+rule stayed, folded into `proto/src/entities.rs` as `SESSION_STALE_MS`,
+`Indicator`, `effective_indicator`, and `display_status` — the engine and the
+harnesses enforce that window themselves. **Upstream commits touching
+`proto/src/view.rs` or `proto/src/motion.rs` are now out of scope unless they
+change the staleness rule.**
+
 To review only changes added after the applied checkpoint:
 
 ```bash
