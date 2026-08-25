@@ -1,16 +1,3 @@
-//! Session document schema over `loro`.
-//!
-//! Container layout is kept stable for local snapshot compatibility:
-//! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }
-//! - `messages`: LoroList of LoroMap {
-//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
-//! - `commands`: LoroList of LoroMap {
-//!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
-//!
-//! Part maps: { id, kind: "text"|"tool"|"input"|"error", text?: LoroText, call?: json,
-//! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
-//! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
-
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
@@ -36,14 +23,12 @@ pub enum MessageRole {
     System,
 }
 
-/// One entry in the doc's `messages` list (`SessionMessageEntry` in TS).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMessageEntry {
     pub id: String,
     pub role: MessageRole,
     pub parts: Vec<MessagePart>,
-    /// Epoch millis.
     pub created_at: i64,
     pub device_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,8 +37,6 @@ pub struct SessionMessageEntry {
     pub continuation_of: Option<String>,
 }
 
-/// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
-/// [`MessagePart`]: input parts key on their request id, error parts store `message`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DocPartJson {
@@ -71,37 +54,26 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
-    /// Tool output summary (additive — absent on old rows and old writers;
-    /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<String>,
-    /// Capped inline tool diff (additive; pre-strip writers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff: Option<serde_json::Value>,
-    /// Optional local key of the full output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_ref: Option<String>,
-    /// Full-output byte length (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_bytes: Option<u64>,
-    /// Optional local key of the full diff JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_ref: Option<String>,
-    /// Per-file diff stats (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_stats: Option<serde_json::Value>,
-    /// Subagent doc/blob ref carried by a spawn chip (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_ref: Option<String>,
-    /// Subagent lifecycle ("running"/"done"/"failed", additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_status: Option<String>,
-    /// One-line live tail of the subagent's output (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_tail: Option<String>,
 }
 
-/// App parts → doc part json (mirror of `toDocParts`).
 fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     Ok(match part {
         MessagePart::Text { id, text } => DocPartJson {
@@ -128,8 +100,6 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             id: id.clone(),
             kind: "tool".into(),
             call: Some(serde_json::to_value(call)?),
-            // TS shape parity: `isError` is written only once the tool result arrived;
-            // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
             output: output.clone(),
             diff: diff.as_ref().map(serde_json::to_value).transpose()?,
@@ -170,7 +140,6 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     })
 }
 
-/// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
@@ -219,18 +188,15 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
     }
 }
 
-/// A session doc handle: typed access over a LoroDoc with the schema above.
 pub struct SessionDoc {
     doc: LoroDoc,
 }
 
 impl SessionDoc {
-    /// Wrap an existing doc (e.g. imported from a snapshot).
     pub fn from_doc(doc: LoroDoc) -> Self {
         Self { doc }
     }
 
-    /// Create + initialize a fresh doc for `chat_id` (host-only).
     pub fn init(chat_id: &str) -> Result<Self, DocError> {
         let doc = LoroDoc::new();
         let meta = doc.get_map("meta");
@@ -251,8 +217,6 @@ impl SessionDoc {
         }
     }
 
-    /// Insert a complete message entry (user/system messages, command-side inserts).
-    /// Streaming assistant entries go through [`SegmentWriter`].
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
         let map = messages.push_container(LoroMap::new())?;
@@ -265,16 +229,7 @@ impl SessionDoc {
         Ok(())
     }
 
-    /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
-    ///
-    /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
-    /// (an entry map imported before the update that fills its fields) or a
-    /// peer on a newer schema must degrade to a missing row, never blank the
-    /// whole transcript — one bad entry took down every publish for the chat
-    /// (2026-07-31, "missing field `id`" during a multi-update import).
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
-        // Materialize only the messages container — a whole-doc deep value
-        // here also serialized the commands ledger on every 120ms commit tick.
         let messages = self
             .doc
             .get_list("messages")
@@ -297,14 +252,7 @@ impl SessionDoc {
             .collect())
     }
 
-    /// Read the commands ledger.
-    ///
-    /// Same skip-not-fail policy as `read_entries`: any device can append
-    /// here, and one malformed entry must not wedge command draining for the
-    /// chat forever (an unparseable command can't be executed anyway).
     pub fn read_commands(&self) -> Result<Vec<SessionCommandEntry>, DocError> {
-        // Container-scoped for the same reason as `read_entries`: the drain
-        // loop runs this per tick and must not pay for the transcript.
         let commands = self
             .doc
             .get_list("commands")
@@ -323,7 +271,6 @@ impl SessionDoc {
             .collect())
     }
 
-    /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
         let map = commands.push_container(LoroMap::new())?;
@@ -359,7 +306,6 @@ impl SessionDoc {
         Ok(())
     }
 
-    /// Rule 2: host (or the issuing composer, for `cancelled`) writes an outcome.
     pub fn set_command_status(
         &self,
         command_id: &str,
@@ -393,9 +339,6 @@ impl SessionDoc {
         Err(DocError::Schema(format!("command {command_id} not found")))
     }
 
-    /// Stamp a terminal status on an existing message entry by id (recovery:
-    /// abandoned `streaming` entries from a dead run are stamped `aborted`).
-    /// Returns `false` when no entry with that id exists.
     pub fn set_message_status(
         &self,
         message_id: &str,
@@ -420,9 +363,6 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// Append an error part to an existing entry (crash recovery: the aborted
-    /// entry must SAY why it ended — "Run interrupted by engine restart…" —
-    /// not just truncate silently). Returns `false` when no entry matches.
     pub fn append_error_part(
         &self,
         message_id: &str,
@@ -448,7 +388,6 @@ impl SessionDoc {
             else {
                 continue;
             };
-            // Idempotent per part id (recovery may re-run on a crash loop).
             for j in 0..parts.len() {
                 if let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
                     parts.get(j)
@@ -473,11 +412,6 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// Mark the input part carrying `request_id` resolved, wherever it lives
-    /// (input parts store the request id as their part id). The live-run path
-    /// resolves through the entry fold; this direct write is for answers to a
-    /// question whose run already died — no fold owns the entry anymore.
-    /// Returns `false` when no such part exists.
     pub fn resolve_input(&self, request_id: &str) -> Result<bool, DocError> {
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
@@ -515,11 +449,6 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// Update a subagent SPAWN CHIP (a tool part) in place, wherever it
-    /// lives: `resolved`-style stamping for the eager-done world, where the
-    /// chip's entry is usually already finished by the time the background
-    /// subagent produces its lifecycle. Searched from the NEWEST entry back
-    /// (the chip belongs to a recent turn). `None` fields are left as-is.
     pub fn update_subagent_chip(
         &self,
         part_id: &str,
@@ -571,7 +500,6 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -608,7 +536,6 @@ fn status_str(status: MessageStatus) -> &'static str {
     }
 }
 
-/// Append one part map to a parts list; text bodies become LoroText containers.
 fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     let map = parts.push_container(LoroMap::new())?;
     let doc_part = to_doc_part(part)?;
@@ -688,20 +615,10 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             status: raw.status,
             continuation_of: raw.continuation_of,
         }),
-        // 2026-08-10 incident rule: a missing field must cost AT MOST what
-        // the field carried — never the entry, never the transcript. Local
-        // snapshots may contain writes from different app versions; one bad writer
-        // (or one mangled export) blanking whole sessions for every reader
-        // is exactly what tonight looked like.
         Err(strict_err) => salvage_entry(v, strict_err),
     }
 }
 
-/// Field-level salvage for entries the strict shape rejects. Missing
-/// identity/attribution fields get deterministic stand-ins (content-hashed
-/// id, so repeated reads and continuation joins stay stable); parts are
-/// salvaged individually — a part missing `kind` is inferred from its
-/// content shape, and only truly contentless parts are dropped.
 fn salvage_entry(
     v: serde_json::Value,
     strict_err: serde_json::Error,
@@ -754,9 +671,6 @@ fn salvage_entry(
     })
 }
 
-/// Salvage one part whose strict `DocPartJson` parse failed: infer the kind
-/// from the content shape (`text` → text part, parseable `call` → tool
-/// part). `None` only when nothing renderable survives.
 fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<MessagePart> {
     let obj = part.as_object()?;
     let id = obj
@@ -808,8 +722,6 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
     None
 }
 
-/// Render-time continuation join at the entry level (`joinContinuations` in TS):
-/// concatenate continuation entries' parts onto their root, in list order.
 pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<SessionMessageEntry> {
     if !entries.iter().any(|e| e.continuation_of.is_some()) {
         return entries;
@@ -822,7 +734,6 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
                 if let Some(&at) = root_index.get(root_id) {
                     out[at].parts.extend(entry.parts);
                 } else {
-                    // Orphan continuation — surface as its own entry rather than dropping.
                     out.push(entry);
                 }
             }
@@ -835,27 +746,13 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
     out
 }
 
-/// Incremental streaming writer for one assistant entry.
-///
-/// Port of zeron's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
-/// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
-/// the doc and writes only the delta:
-/// - trailing text growth → `LoroText` append (RLE-merged),
-/// - new parts → pushed,
-/// - tool call refresh / resolution / input resolution → in-place map updates.
-///
-/// Invariant relied upon: the fold only ever APPENDS parts or grows the trailing text; earlier
-/// text never mutates. Tool/input parts may update fields in place.
 pub struct SegmentWriter<'a> {
     doc: &'a SessionDoc,
-    /// Index of this entry in the `messages` list.
     entry_index: usize,
-    /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
 }
 
 impl<'a> SegmentWriter<'a> {
-    /// Begin a streaming assistant entry: pushes the entry with `status: streaming`, no parts.
     pub fn begin(
         doc: &'a SessionDoc,
         entry_id: &str,
@@ -886,10 +783,6 @@ impl<'a> SegmentWriter<'a> {
         })
     }
 
-    /// Reattach to a streaming entry a prior [`Self::begin`] pushed on the
-    /// same doc, with the caller-held mirror of what was already written —
-    /// the seam that lets a sink hold `(entry_index, written)` between
-    /// coalesced flushes instead of a doc-borrowing writer.
     pub fn resume(doc: &'a SessionDoc, entry_index: usize, written: Vec<MessagePart>) -> Self {
         Self {
             doc,
@@ -898,7 +791,6 @@ impl<'a> SegmentWriter<'a> {
         }
     }
 
-    /// The state a later [`Self::resume`] needs.
     pub fn into_state(self) -> (usize, Vec<MessagePart>) {
         (self.entry_index, self.written)
     }
@@ -920,7 +812,6 @@ impl<'a> SegmentWriter<'a> {
         }
     }
 
-    /// Diff `folded` (the full folded segment so far) into the doc.
     pub fn sync(&mut self, folded: &[MessagePart]) -> Result<(), DocError> {
         let parts = self.parts_list()?;
         let mut dirty = false;
@@ -939,7 +830,6 @@ impl<'a> SegmentWriter<'a> {
                             MessagePart::Text { text: old, .. },
                             MessagePart::Text { text: new, .. },
                         ) if new.starts_with(old.as_str()) => {
-                            // Trailing-text growth: append the suffix into the LoroText.
                             let delta = &new[old.len()..];
                             if !delta.is_empty() {
                                 let part_map = part_map_at(&parts, i)?;
@@ -960,9 +850,6 @@ impl<'a> SegmentWriter<'a> {
                             }
                         }
                         _ => {
-                            // Field-level update (tool refresh/resolve, input resolve, or a
-                            // non-append text rewrite, which the fold shouldn't produce —
-                            // rewrite the part map fields defensively).
                             let part_map = part_map_at(&parts, i)?;
                             update_part_fields(&part_map, part)?;
                             dirty = true;
@@ -979,7 +866,6 @@ impl<'a> SegmentWriter<'a> {
         Ok(())
     }
 
-    /// Finish the stream: sync final parts and stamp a terminal status.
     pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
         self.sync(folded)?;
         let map = self.entry_map()?;
@@ -996,7 +882,6 @@ fn part_map_at(parts: &LoroList, index: usize) -> Result<LoroMap, DocError> {
     }
 }
 
-/// In-place field refresh for tool/input parts (and defensive text rewrite).
 fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError> {
     let doc_part = to_doc_part(part)?;
     if let Some(call) = &doc_part.call {
@@ -1042,7 +927,6 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
     if let Some(text) = &doc_part.text {
-        // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
             t.update(text, Default::default())
                 .map_err(|e| DocError::Schema(e.to_string()))?;
@@ -1055,7 +939,6 @@ fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
     LoroValue::from(v.clone())
 }
 
-/// Compact transcript tail shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTail {
@@ -1066,7 +949,6 @@ pub struct SessionTail {
     pub updated_at: i64,
 }
 
-/// Materialize the last-N joined messages (`materializeTail` in TS).
 pub fn materialize_tail(
     doc: &SessionDoc,
     now: i64,
@@ -1128,9 +1010,6 @@ mod tests {
 
     #[test]
     fn segment_sync_persists_subagent_chip_fields_on_live_parts() {
-        // The eager-done world's OTHER path: the chip mutates while its
-        // segment still streams (codex fan-outs) — update_part_fields must
-        // carry the chip fields or SegmentWriter::sync drops them silently.
         let doc = SessionDoc::init("c1").unwrap();
         let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
         let mut part = MessagePart::Tool {
@@ -1194,7 +1073,6 @@ mod tests {
             }],
             created_at: 1,
             device_id: "dev-a".into(),
-            // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
             continuation_of: None,
         })
@@ -1234,7 +1112,6 @@ mod tests {
         a.push_message(&user_entry("m-a", "from a")).unwrap();
         b.push_message(&user_entry("m-b", "from b")).unwrap();
 
-        // Cross-import updates.
         let a_update = a
             .doc()
             .export(ExportMode::updates(&b.doc().oplog_vv()))
@@ -1249,7 +1126,7 @@ mod tests {
         let ea = a.read_entries().unwrap();
         let eb = b.read_entries().unwrap();
         assert_eq!(ea, eb);
-        assert_eq!(ea.len(), 2); // one insert from each peer, converged in the same order
+        assert_eq!(ea.len(), 2);
     }
 
     #[test]
@@ -1303,10 +1180,6 @@ mod tests {
         }
     }
 
-    /// The ToolResult resolution path goes through `update_part_fields` —
-    /// the stripped output summary, sidecar refs, and diff stats must survive
-    /// the doc round trip (regression: output/diff were silently dropped
-    /// there while `to_doc_part` carried them).
     #[test]
     fn segment_writer_round_trips_stripped_tool_fields() {
         let doc = SessionDoc::init("chat-2").unwrap();
@@ -1351,11 +1224,6 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: the fold drops outputs entirely (journal
-                // only), so even a direct apply_sidecar_refs call has no
-                // output to key — diff stats still get their ref (this test
-                // calls apply_sidecar_refs directly; the live fold no longer
-                // does).
                 assert_eq!(output.as_deref(), None);
                 assert_eq!(output_ref.as_deref(), None);
                 assert_eq!(*output_bytes, None);
@@ -1369,8 +1237,6 @@ mod tests {
         }
     }
 
-    /// Old pre-strip docs carry inline `output`/`diff` — they must still read
-    /// back (schema changes are serde-additive ONLY; old readers, old docs).
     #[test]
     fn pre_strip_doc_parts_still_round_trip() {
         let doc = SessionDoc::init("chat-3").unwrap();
@@ -1474,14 +1340,8 @@ mod tests {
         assert_eq!(tail.chat_id, "chat-1");
     }
 
-    /// 2026-08-10 incident: entries/parts missing strict fields must salvage
-    /// field-by-field — a fresh reader importing a merged local doc must
-    /// never render a BLANK transcript because some writer (old app version,
-    /// other-platform client, mangled export) omitted metadata.
     #[test]
     fn malformed_entries_salvage_instead_of_vanishing() {
-        // Entry missing `id` + `deviceId`; one part missing `kind` but
-        // carrying text; one part contentless (dropped).
         let v = serde_json::json!({
             "role": "assistant",
             "createdAt": 123,
@@ -1510,7 +1370,6 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // Tool part missing `kind` but with a parseable call salvages as Tool.
         let v = serde_json::json!({
             "role": "assistant",
             "createdAt": 1,
@@ -1522,11 +1381,9 @@ mod tests {
             MessagePart::Tool { resolved: true, .. }
         ));
 
-        // Only non-objects are truly unsalvageable.
         assert!(entry_from_json(serde_json::json!("garbage")).is_err());
         assert!(entry_from_json(serde_json::json!(42)).is_err());
 
-        // Well-formed entries take the strict path unchanged.
         let v = serde_json::json!({
             "id": "m1", "role": "user", "createdAt": 5, "deviceId": "d",
             "parts": [ { "id": "p", "kind": "text", "text": "hi" } ]

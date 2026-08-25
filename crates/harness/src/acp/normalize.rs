@@ -1,29 +1,14 @@
-//! ACP `session/update` → [`AgentEvent`] mapping (protocol v1, the line the
-//! claude/codex adapters and Grok Build speak today).
-//!
-//! Tolerant by construction, like the codex normalizer: decoded from raw
-//! [`Value`]s, unknown `sessionUpdate` kinds and content types map to nothing,
-//! and missing fields degrade to empty strings rather than errors. Wire shapes
-//! verified against `agent-client-protocol-schema` 1.3.0 (`SessionUpdate` is
-//! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
-//! statuses are snake_case).
-
 use serde_json::Value;
 use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
 
-/// Byte cap applied to tool output text at the harness boundary. The doc-side
-/// fold applies its own (smaller) cap before anything persists; this one only
-/// bounds what crosses the event stream.
 pub(crate) const OUTPUT_CAP: usize = 16 * 1024;
 
-/// Byte cap for each side of an inline diff crossing the event stream.
 pub(crate) const DIFF_TEXT_CAP: usize = 64 * 1024;
 
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
-/// Truncate on a char boundary, marking the cut so a host can say "truncated".
 pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_owned();
@@ -37,21 +22,17 @@ pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     out
 }
 
-/// The text of a `ContentBlock` (`{type: "text", text}`); non-text blocks
-/// (image, audio, resource, resource_link) render as nothing.
 fn content_block_text(block: &Value) -> Option<&str> {
     (block.get("type").and_then(Value::as_str) == Some("text"))
         .then(|| block.get("text").and_then(Value::as_str))
         .flatten()
 }
 
-/// A `ContentChunk`'s streamed text (`{content: {type: "text", ...}}`).
 pub(crate) fn chunk_text(update: &Value) -> Option<String> {
     let text = content_block_text(update.get("content")?)?;
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// Joined text of a tool call's `content` array, capped; `None` when empty.
 fn tool_output(update: &Value) -> Option<String> {
     let parts: Vec<&str> = update
         .get("content")?
@@ -67,7 +48,6 @@ fn tool_output(update: &Value) -> Option<String> {
     Some(cap_text(&parts.join("\n"), OUTPUT_CAP))
 }
 
-/// First `{type: "diff"}` entry of a tool call's `content` array.
 fn tool_diff(update: &Value) -> Option<ToolDiff> {
     let diff = update
         .get("content")?
@@ -91,23 +71,15 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
     })
 }
 
-/// The grok-native tool name stamped on a tool call's `_meta` (`x.ai/tool`,
-/// present on every grok tool_call — verified live, 1.0.4).
 pub(crate) fn xai_tool_name(update: &Value) -> Option<&str> {
     update.get("_meta")?.get("x.ai/tool")?.get("name")?.as_str()
 }
 
-/// First location path (`locations: [{path, line?}]`), for read/edit calls.
 fn first_location(update: &Value) -> Option<String> {
     let path = update.get("locations")?.as_array()?.first()?.get("path")?;
     path.as_str().filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
-/// Cursor (and similar ACP agents) put a human summary in `title` — generic
-/// labels ("Read File", "grep") before args arrive, or a markdown-wrapped
-/// command (`` `ls -la` `` with inner backticks escaped as `\``). Those are
-/// display strings, not typed arguments; using them as path/pattern/command
-/// dumps the label (and its escapes) into the transcript chip.
 fn is_placeholder_title(title: &str) -> bool {
     matches!(
         title.trim(),
@@ -130,7 +102,6 @@ fn is_placeholder_title(title: &str) -> bool {
     )
 }
 
-/// Unwrap a single markdown code span used as an ACP exec title.
 fn unwrap_command_title(title: &str) -> Option<String> {
     let inner = title.trim().strip_prefix('`')?.strip_suffix('`')?;
     let mut out = String::with_capacity(inner.len());
@@ -160,11 +131,6 @@ fn arg_from_title(title: &str) -> Option<String> {
     }
 }
 
-/// Reduce an ACP tool call (kind + title + rawInput + locations + diff
-/// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
-/// in how much structure they put in `rawInput`, so every arm has a fallback.
-/// Title is only used when it looks like a real arg — never a placeholder
-/// label or markdown-escaped summary.
 fn typed_call(update: &Value) -> ToolCall {
     let kind = update
         .get("kind")
@@ -194,8 +160,6 @@ fn typed_call(update: &Value) -> ToolCall {
                 .unwrap_or_default(),
         },
         "edit" | "delete" | "move" => {
-            // A diff pins down the file and shape; otherwise fall back to the
-            // location/rawInput path with unknown content.
             if let Some(diff) = tool_diff(update) {
                 if diff.old_text.is_none() {
                     ToolCall::WriteFile {
@@ -225,8 +189,6 @@ fn typed_call(update: &Value) -> ToolCall {
             }
         }
         "search" => {
-            // Cursor web search is kind "search" + rawInput.searchTerm; grep
-            // / glob / codebase search use pattern or query.
             if let Some(query) = raw_str("searchTerm") {
                 ToolCall::WebSearch { query }
             } else {
@@ -249,9 +211,6 @@ fn typed_call(update: &Value) -> ToolCall {
                     .unwrap_or_default(),
             },
         },
-        // Kindless (or unknown-kind) update carrying a diff: an edit in all
-        // but name — some agents only attach the diff on the completion
-        // update without repeating the kind.
         _ if tool_diff(update).is_some() => {
             let diff = tool_diff(update).expect("guarded");
             if diff.old_text.is_none() {
@@ -267,18 +226,12 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
-        // Grok's subagent spawn: name the chip — and the subagent tab it
-        // opens — after the task, matching the claude driver's "Agent: {d}"
-        // (the bare tool name says nothing in a tab strip).
         _ if xai_tool_name(update) == Some("spawn_subagent") => ToolCall::Unknown {
             name: raw_str("description")
                 .map(|d| format!("Agent: {d}"))
                 .unwrap_or_else(|| "Agent".into()),
             input: raw.cloned(),
         },
-        // opencode's subagent spawn (`task` tool — rawInput carries
-        // description/prompt/subagent_type): same naming as grok's, so the
-        // chip and its subagent tab say what the agent is doing.
         _ if raw.is_some_and(|r| r.get("subagent_type").is_some() && r.get("prompt").is_some()) => {
             ToolCall::Unknown {
                 name: raw_str("description")
@@ -287,10 +240,6 @@ fn typed_call(update: &Value) -> ToolCall {
                 input: raw.cloned(),
             }
         }
-        // Its completion drops rawInput but keeps a title (the description),
-        // which would re-type the chip to a bare Unknown and cost it the
-        // Agent icon/label. The rawOutput metadata (child + parent session
-        // ids) still marks the spawn — keep the naming.
         _ if update
             .get("rawOutput")
             .and_then(|r| r.get("metadata"))
@@ -328,9 +277,6 @@ fn typed_call(update: &Value) -> ToolCall {
     }
 }
 
-/// Map one `session/update` payload's `update` object to events.
-/// Message/thought chunks are handled here too (unlike codex, ACP has no
-/// separate delta channel).
 pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
     let kind = update
         .get("sessionUpdate")
@@ -343,8 +289,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         "agent_thought_chunk" => chunk_text(update)
             .map(|text| vec![AgentEvent::ReasoningDelta { text }])
             .unwrap_or_default(),
-        // Replayed history on session/load is filtered by the session loop
-        // before this map; a live user chunk is our own prompt echoed back.
         "user_message_chunk" => Vec::new(),
         "tool_call" => {
             let id = str_field(update, "toolCallId");
@@ -352,8 +296,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 id: id.clone(),
                 call: typed_call(update),
             }];
-            // Some agents send a single terminal-status `tool_call` with the
-            // result inline instead of a follow-up update.
             if let Some(resolved) = resolved_result(update, id) {
                 events.push(resolved);
             }
@@ -362,10 +304,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         "tool_call_update" => {
             let id = str_field(update, "toolCallId");
             let mut events = Vec::new();
-            // Refresh the call only when the update carries new SHAPE — kind,
-            // title, rawInput, or a diff. Result-only content (output text)
-            // must not re-type the call: a kindless completion update would
-            // clobber the opening call's `Exec` into `Unknown`.
             if update.get("kind").is_some()
                 || update.get("title").is_some()
                 || update.get("rawInput").is_some()
@@ -393,8 +331,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                     done: e.get("status").and_then(Value::as_str) == Some("completed"),
                 })
                 .collect();
-            // The plan has no wire id; a stable synthetic id makes every
-            // update refresh the same chip (fold refreshes in place by id).
             vec![
                 AgentEvent::ToolCall {
                     id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
@@ -412,9 +348,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let commands = parse_commands(update.get("availableCommands"));
             vec![AgentEvent::AvailableCommands { commands }]
         }
-        // Context-window gauge, not per-turn input/output tokens — zeron's
-        // Usage event feeds rate-limit probes, so a wrong mapping is worse
-        // than none. Mode/config/session-info updates carry nothing we render.
         "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
             Vec::new()
         }
@@ -422,8 +355,6 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
     }
 }
 
-/// A terminal `status` on a tool_call/tool_call_update resolves the call:
-/// `completed`/`failed` → ToolResult with capped output + inline diff.
 fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
     let status = update.get("status").and_then(Value::as_str)?;
     let is_error = match status {
@@ -439,7 +370,6 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
     })
 }
 
-/// Decode an `availableCommands` array (`{name, description, input: {hint}}`).
 pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
     value
         .and_then(Value::as_array)
@@ -461,8 +391,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         .collect()
 }
 
-/// `session/request_permission` options (`{optionId, name, kind}`) → the
-/// preferred auto-approve choice: `allow_always` > `allow_once` > first.
 pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
     let by_kind = |kind: &str| {
         options
@@ -501,7 +429,6 @@ mod tests {
             map_update(&thought),
             vec![AgentEvent::ReasoningDelta { text: "hmm".into() }]
         );
-        // Non-text blocks render as nothing.
         let image = json!({
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "image", "data": "...", "mimeType": "image/png" },
@@ -692,7 +619,6 @@ mod tests {
             ],
         });
         let events = map_update(&update);
-        // The content-bearing update refreshes the call, then resolves it.
         let Some(AgentEvent::ToolResult {
             output: Some(output),
             ..
@@ -717,9 +643,6 @@ mod tests {
         assert_eq!(preferred_allow_option(&[]), None);
     }
 
-    /// Cursor ACP opens tool cards with a display `title` before `rawInput`
-    /// is filled (Search "grep", Read "Read File", Web "Web Fetch"). Those
-    /// labels must not become typed args.
     #[test]
     fn cursor_placeholder_titles_are_not_typed_args() {
         let grep = json!({
@@ -864,7 +787,6 @@ mod tests {
 
     #[test]
     fn opencode_task_keeps_agent_naming_across_frames() {
-        // The rawInput frame (in_progress) names the chip off the spawn args.
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "t1",
@@ -882,8 +804,6 @@ mod tests {
             [AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. }]
                 if name == "Agent: Viz probe"
         ));
-        // The completion drops rawInput (title = the bare description); the
-        // rawOutput metadata still marks the spawn — naming survives.
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "t1",

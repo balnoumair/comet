@@ -1,39 +1,3 @@
-//! Cursor harness: drives Cursor's agent runtime through the PINNED
-//! `@cursor/sdk` via a thin zeron-owned Node shim (`shim.mjs`, JSONL over
-//! stdio) — NOT over ACP, and NOT over `cursor-agent`'s print surface.
-//!
-//! Why: Cursor's ACP surface is lossy (subagent transcripts are stripped at
-//! the boundary — verified live) and Cursor points integrators at the SDK.
-//! The SDK does not wrap the cursor-agent binary at all: it is the agent
-//! runtime bundled in-process, speaking proprietary protobuf/ConnectRPC to
-//! Cursor's backend with client-side tool execution — there is no speakable
-//! stdio wire to drive from Rust, so the shim IS the wire. The print surface
-//! (`cursor-agent -p --trust`) is permission-free and is never used.
-//!
-//! VERSION PIN: [`CURSOR_SDK_PIN`]. The SDK is PUBLIC BETA with ~weekly
-//! releases; the shim maps only the update kinds this pin ships and ignores
-//! unknown ones, so churn degrades output rather than erroring the chat.
-//! Revalidate the shim against the typings on every bump.
-//!
-//! - The shim is materialized into the SDK's managed npm install
-//!   (`~/.zeron/adapters/…`, [`crate::adapter_install::ensure_installed_shim`])
-//!   and spawned as `node <shim>`.
-//! - Done = the SDK run's terminal result (`turn` frame off `run.wait()` /
-//!   `turn-ended`) — a crisp turn end by construction.
-//! - Subagents: the SDK streams the FULL nested transcript as
-//!   `tool-call-delta { callId, taskUpdate }`; the shim tags those frames
-//!   with the spawning task's call id and they surface here as
-//!   [`AgentEvent::Subagent`].
-//! - Questions: the SDK has no public answer channel for `askQuestion`
-//!   (its `request` stream message carries only an id), so the tool is
-//!   disallowed at agent creation — a question would otherwise block the
-//!   run forever with no way to answer it. Known gap vs the ACP surface.
-//! - AUTH: the SDK's credentials are SEPARATE from `cursor-agent login`
-//!   (verified live). Runs need `CURSOR_API_KEY` (or a prior SDK browser
-//!   login); the shim surfaces the exact fix as an error chip otherwise.
-//! - Steering: turn-boundary — steers queue and become the next turn on the
-//!   parked session (parity with the previous ACP behavior).
-
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -53,8 +17,6 @@ use zeron_proto::{
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 
-/// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
-/// typings). Bump deliberately — see the module header.
 const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.28";
 const SHIM_NAME: &str = "zeron-cursor-shim.mjs";
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
@@ -70,15 +32,10 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
     dirs
 }
 
-/// The Cursor harness. Construct with [`CursorHarness::new`]; tests point it
-/// at a fake shim process with [`CursorHarness::with_executable`].
 pub struct CursorHarness {
-    /// Test seam: run this program AS the shim instead of node+managed SDK.
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
-    /// Discovery cache: only a successful, non-empty catalog is cached, so a
-    /// failed probe (offline, SDK churn) retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
@@ -109,7 +66,6 @@ impl CursorHarness {
         self
     }
 
-    /// Spawn the shim in models mode and map its one catalog frame.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
@@ -141,11 +97,6 @@ impl CursorHarness {
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
     }
 
-    /// Ask the installed Cursor CLI for its model catalog. The CLI already
-    /// has the user's Cursor login, while `@cursor/sdk` uses a separate
-    /// credential store and currently rejects `Cursor.models.list()` without
-    /// an API key. The CLI output is intentionally text, so this is a
-    /// compatibility fallback rather than the primary typed-options source.
     async fn discover_cli_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = crate::acp::find_on_paths("cursor-agent", cursor_cli_paths())
             .ok_or_else(|| HarnessError::NotInstalled("cursor-agent".into()))?;
@@ -175,9 +126,6 @@ impl CursorHarness {
         Ok(models)
     }
 
-    /// (program, args) for the shim process: the test override, or node
-    /// running the shim inside the managed SDK install (installing it on
-    /// first use).
     pub async fn resolve_shim(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
         if let Some(p) = &self.executable {
             return Ok((p.clone(), Vec::new()));
@@ -195,11 +143,6 @@ impl CursorHarness {
     }
 }
 
-/// A ready-to-spawn command for the shim's LOGIN mode: the SDK's PKCE
-/// browser flow, minting the key into `store_path` (never the live
-/// `~/.cursor/sdk/auth.json` — the engine snapshots the store file as an
-/// account slot). Emits `{"ev":"auth-url"}` then `{"ev":"logged-in"}` /
-/// `{"ev":"fatal"}` JSONL on stdout; kill to cancel.
 pub async fn login_command(store_path: &std::path::Path) -> Result<Command, HarnessError> {
     let (exe, args) = CursorHarness::default().resolve_shim().await?;
     let mut cmd = Command::new(&exe);
@@ -220,36 +163,25 @@ impl Harness for CursorHarness {
     fn supports_steering(&self) -> bool {
         true
     }
-    /// The SDK has no mid-turn injection; steers queue for the next turn.
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::TurnBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
     }
-    /// "Installed" means the user's own cursor-agent CLI is present — the
-    /// user-visible signal they use Cursor (the SDK itself is a managed
-    /// install zeron performs on demand).
     fn installed(&self) -> bool {
         self.executable.is_some()
             || crate::acp::find_on_paths("cursor-agent", cursor_cli_paths()).is_some()
     }
-    /// Done is the SDK run's terminal result, for every turn shape.
     fn deterministic_turn_end(&self) -> bool {
         true
     }
 
-    /// Live catalog via the installed Cursor CLI, with the SDK shim as a
-    /// fallback for environments that have an SDK API key but no CLI login.
-    /// A minimal static pair remains the last resort and is intentionally not
-    /// cached, so the next picker open retries discovery.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
 
-        // `with_executable` is the fake-shim test seam; do not let a host
-        // Cursor installation change those deterministic tests.
         if self.executable.is_none() {
             match self.discover_cli_models().await {
                 Ok(models) if !models.is_empty() => {
@@ -334,8 +266,6 @@ impl Harness for CursorHarness {
             "prompt": request.prompt,
             "cwd": request.cwd,
             "model": request.model,
-            // Typed parameter picks (thinking/context/effort/fast/…) — the
-            // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
             "resume": request.resume,
         });
@@ -362,8 +292,6 @@ impl Harness for CursorHarness {
     }
 }
 
-/// The fallback pair when discovery fails: well-known ids that resolve as
-/// aliases in Cursor's real catalog, so a degraded picker still runs.
 fn static_models() -> Vec<Model> {
     vec![
         Model {
@@ -383,8 +311,6 @@ fn static_models() -> Vec<Model> {
     ]
 }
 
-/// Parse the stable human-readable shape emitted by `cursor-agent models`:
-/// `model-id - Display Name`. Unknown headings and diagnostics are ignored.
 fn parse_cli_models(output: &str) -> Vec<Model> {
     output
         .lines()
@@ -406,10 +332,6 @@ fn parse_cli_models(output: &str) -> Vec<Model> {
         .collect()
 }
 
-/// `Cursor.models.list()` items → picker models. Item shape (1.0.28
-/// `options.d.ts` `ModelListItem`): `{id, displayName, description?,
-/// aliases?, parameters?: [{id, displayName?, values: [{value,
-/// displayName?}]}], variants?: [{params: [{id, value}], isDefault?}]}`.
 fn map_model_items(items: &Value) -> Vec<Model> {
     let str_of = |v: &Value, key: &str| -> Option<String> {
         v.get(key)
@@ -424,14 +346,10 @@ fn map_model_items(items: &Value) -> Vec<Model> {
         .iter()
         .filter_map(|item| {
             let id = str_of(item, "id")?;
-            // `default` is a bare alias twin of the parameterized Auto entry
-            // (`auto-smart`) — two "Auto" rows would just confuse the picker.
             if id == "default" {
                 return None;
             }
             let label = str_of(item, "displayName").unwrap_or_else(|| id.clone());
-            // A variant marked default carries the catalog's preferred value
-            // for each parameter (e.g. Auto's optimize_for=balanced).
             let default_variant = item
                 .get("variants")
                 .and_then(Value::as_array)
@@ -548,7 +466,6 @@ async fn run_session(session: Session) {
     let mut interrupt_sent = false;
     let mut any_done = false;
     let mut done_after_interrupt = false;
-    // A turn is settled and the session is parked awaiting the next prompt.
     let mut parked = false;
     let mut queued_steers: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
@@ -599,8 +516,6 @@ async fn run_session(session: Session) {
                         _ => {
                             for ev in map_shim_frame(&frame, interrupted) {
                                 let is_done = matches!(ev, AgentEvent::Done { .. });
-                                // Stamp the session id onto Dones the mapper
-                                // couldn't know.
                                 let ev = if let AgentEvent::Done { status, result, error, .. } = ev {
                                     AgentEvent::Done { status, result, error, session_id: session_id.clone() }
                                 } else {
@@ -615,9 +530,6 @@ async fn run_session(session: Session) {
                                         done_after_interrupt = true;
                                         break 'main;
                                     }
-                                    // Turn boundary: a queued steer becomes
-                                    // the next turn; otherwise park for the
-                                    // mailbox (caller owns teardown).
                                     if let Some(text) = queued_steers.pop_front() {
                                         let prev = std::mem::replace(
                                             &mut assistant_message_id,
@@ -646,7 +558,7 @@ async fn run_session(session: Session) {
                         }
                     }
                 }
-                Ok(None) => break 'main, // shim exited
+                Ok(None) => break 'main,
                 Err(e) => {
                     let _ = event_tx.send(Err(HarnessError::Io(e))).await;
                     break 'main;
@@ -669,7 +581,6 @@ async fn run_session(session: Session) {
                         let _ = stdin_tx
                             .send(json!({ "op": "user", "prompt": msg.prompt }).to_string());
                     } else {
-                        // Turn-boundary steering: queue for the next boundary.
                         queued_steers.push_back(msg.prompt);
                     }
                 }
@@ -710,9 +621,6 @@ async fn run_session(session: Session) {
                 }))
                 .await;
         } else if !interrupted && !any_done {
-            // Give the just-died child a beat to be reaped and its stderr
-            // reader to drain, so the crash message carries the real exit
-            // status and tail instead of "still running".
             let status = tokio::time::timeout(Duration::from_millis(500), child.wait())
                 .await
                 .ok()
@@ -735,8 +643,6 @@ async fn run_session(session: Session) {
     }
 }
 
-/// Decode one cursor SDK tool (public vocabulary name + args) into a typed
-/// [`ToolCall`], tolerant of arg spellings.
 fn decode_tool(name: &str, args: &Value) -> ToolCall {
     let s = |keys: &[&str]| {
         keys.iter()
@@ -808,8 +714,6 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
             tool: s(&["tool", "toolName", "name"]),
             input: args.get("args").or(args.get("input")).cloned(),
         },
-        // The subagent spawn: the chip the engine folds; its interior
-        // arrives as tagged frames keyed by this call's id.
         "task" => ToolCall::Unknown {
             name: {
                 let description = s(&["description", "prompt"]);
@@ -828,7 +732,6 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
     }
 }
 
-/// Map one shim frame to events. `Done` session ids are stamped by the loop.
 fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
     let text = || {
         frame
@@ -867,12 +770,6 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                         id: id.clone(),
                         call: decode_tool(name, &args),
                     })];
-                    // A spawn's prompt is the subagent's opening user
-                    // message — the SDK's nested stream never carries it
-                    // (only the child's own updates), so seed it at the
-                    // spawn and the subagent transcript starts the way
-                    // every chat does. Top-level spawns only: nested
-                    // spawns' interiors share their parent's doc.
                     if name == "task" && parent.is_none() {
                         if let Some(prompt) = args
                             .get("prompt")
@@ -904,10 +801,6 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                             diff: None,
                         }),
                     ];
-                    // A finished task IS the subagent finishing: the SDK has
-                    // no separate terminal frame for the nested transcript,
-                    // so the spawn tool's end doubles as the tagged Done that
-                    // flips the chip and freezes the subagent doc.
                     if name == "task" && parent.is_none() {
                         events.push(AgentEvent::Subagent {
                             parent_tool_use_id: id,
@@ -1016,7 +909,6 @@ mod tests {
                 && parent_tool_use_id == "call_task_1"
                 && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "scan the fold path")
         ));
-        // A NESTED spawn's interior shares its parent's doc: no seeding.
         let nested: Value = serde_json::from_str(
             r#"{"ev":"tool","phase":"start","id":"call_task_2","name":"task","args":{"prompt":"inner"},"parent":"call_task_1"}"#,
         )

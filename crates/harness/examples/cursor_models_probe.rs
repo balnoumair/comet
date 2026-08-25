@@ -1,4 +1,3 @@
-//! Live probe: real cursor model discovery through the harness path.
 use zeron_harness::{CursorHarness, Harness};
 
 #[tokio::main]

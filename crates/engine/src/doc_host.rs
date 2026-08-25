@@ -1,9 +1,3 @@
-//! Local per-chat session documents.
-//!
-//! A chat document is the durable local transcript and command queue. Changes
-//! are published to local watchers, pending commands are drained by the local
-//! sessions engine, and snapshots are debounced into SQLite.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};

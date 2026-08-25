@@ -1,15 +1,3 @@
-//! Per-session on-disk event journal (port of zeron's `run-journal.ts`, JSONL-shaped).
-//!
-//! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
-//! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
-//! journal is the durable replay source for live streams (`Subscribe` = replay then tail
-//! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not
-//! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
-//! `aborted` and closes the journal with a synthetic `Done`.
-//!
-//! Bounded-window compaction is deferred (whole file kept for now, per M2 scope); a torn
-//! trailing line from a crash mid-write is tolerated everywhere.
-
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -37,12 +25,9 @@ struct JournalLine {
 struct ChatJournal {
     file: File,
     next_seq: u64,
-    /// True when the file ends without a newline (torn write) — the next append
-    /// starts with one so the torn line stays isolated.
     needs_newline: bool,
 }
 
-/// Append-only JSONL journal store, one file per chat.
 pub struct RunJournal {
     dir: PathBuf,
     open_files: Mutex<HashMap<String, ChatJournal>>,
@@ -72,9 +57,6 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
-    /// Auto-resume revival budget (zeron `resumeAttempt`/`MAX_AUTO_RESUME`):
-    /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
-    /// revive itself in an infinite boot loop.
     pub fn resume_attempts(&self, chat_id: &str) -> u32 {
         std::fs::read_to_string(self.attempts_path(chat_id))
             .ok()
@@ -90,20 +72,13 @@ impl RunJournal {
         next
     }
 
-    /// A cleanly completed turn resets the budget — only consecutive
-    /// crash-revive-crash cycles exhaust it.
     pub fn clear_resume_attempts(&self, chat_id: &str) {
         let _ = std::fs::remove_file(self.attempts_path(chat_id));
     }
 
-    /// Append one event; returns its journal seq.
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut files = self.lock();
         if !files.contains_key(chat_id) {
-            // Bound the open-fd set: entries were never removed, so every chat
-            // ever run held a descriptor for the process lifetime. Dropping is
-            // safe — the next append reopens and rescans the tail. The cap
-            // comfortably exceeds concurrent runs, so eviction stays rare.
             const OPEN_FILE_CAP: usize = 16;
             if files.len() >= OPEN_FILE_CAP {
                 files.clear();
@@ -120,7 +95,6 @@ impl RunJournal {
                 },
             );
         }
-        // Entry guaranteed present; avoid unwrap in a library path regardless.
         let Some(journal) = files.get_mut(chat_id) else {
             return Err(JournalError::Io(std::io::Error::other(
                 "journal entry vanished under lock",
@@ -144,8 +118,6 @@ impl RunJournal {
         Ok(seq)
     }
 
-    /// Events with `seq > after_seq`, in order. A cursor ahead of the last issued seq is
-    /// from a previous era (file replaced) — falls back to a full replay, mirroring zeron.
     pub fn replay(
         &self,
         chat_id: &str,
@@ -161,7 +133,6 @@ impl RunJournal {
         Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
     }
 
-    /// The last event in a chat's journal, if any (ignores a torn tail line).
     pub fn last_event(&self, chat_id: &str) -> Result<Option<(u64, AgentEvent)>, JournalError> {
         let path = self.path_for(chat_id);
         if !path.exists() {
@@ -170,8 +141,6 @@ impl RunJournal {
         Ok(read_lines(&path)?.into_iter().next_back())
     }
 
-    /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
-    /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
         let mut stale = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
@@ -193,7 +162,6 @@ impl RunJournal {
         Ok(stale)
     }
 
-    /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
         let path = self.path_for(chat_id);
@@ -204,7 +172,6 @@ impl RunJournal {
     }
 }
 
-/// Parse every valid line; malformed lines (torn tail writes) are skipped.
 fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -227,7 +194,6 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     Ok(out)
 }
 
-/// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
 fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -242,9 +208,6 @@ fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
     Ok((next_seq, needs_newline))
 }
 
-/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
-/// arbitrary journals directory — profile import copies these files between
-/// profiles without opening a `RunJournal`.
 pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
     let stem = sanitize_id(chat_id);
     (
@@ -253,8 +216,6 @@ pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Chat ids become file names; anything outside a conservative set is replaced so a
-/// hostile id cannot traverse paths. (Ids are uuids in practice.)
 fn sanitize_id(chat_id: &str) -> String {
     chat_id
         .chars()
@@ -299,7 +260,6 @@ mod tests {
         let after = journal.replay("chat-1", 2).unwrap();
         assert_eq!(after.len(), 1);
         assert!(matches!(after[0].1, AgentEvent::Done { .. }));
-        // Era fallback: cursor ahead of last seq replays everything.
         assert_eq!(journal.replay("chat-1", 99).unwrap().len(), 3);
     }
 
@@ -322,7 +282,6 @@ mod tests {
         journal.append("clean", &text("full")).unwrap();
         journal.append("clean", &done()).unwrap();
         assert_eq!(journal.stale_sessions().unwrap(), vec!["dead".to_string()]);
-        // Closing the stale journal with a Done clears the flag.
         journal.append("dead", &done()).unwrap();
         assert!(journal.stale_sessions().unwrap().is_empty());
     }
@@ -334,7 +293,6 @@ mod tests {
             let journal = RunJournal::open(dir.path()).unwrap();
             journal.append("chat-1", &text("a")).unwrap();
         }
-        // Simulate a crash mid-write: garbage with no trailing newline.
         let path = dir.path().join("chat-1.jsonl");
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"{\"seq\":2,\"event\":{\"type\":\"textD")

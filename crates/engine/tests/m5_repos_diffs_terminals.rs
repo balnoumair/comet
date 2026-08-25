@@ -1,6 +1,3 @@
-//! M5a integration: repos/worktrees, folder listing, checkout-diff capture + sync,
-//! terminals, and the RPC dispatch for each new method over the memory transport.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,10 +12,6 @@ use zeron_engine::{
 };
 use zeron_proto::{GitHistoryRefKind, TerminalEvent};
 use zeron_rpc::methods;
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 async fn git(cwd: &Path, args: &[&str]) {
     let output = tokio::process::Command::new("git")
@@ -55,7 +48,6 @@ async fn git_stdout(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Init a repo at `dir` with one committed file `a.txt`.
 async fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("repo dir");
     git(dir, &["init", "-b", "main"]).await;
@@ -88,8 +80,6 @@ fn decoded(events: &[TerminalEvent]) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// Drain a terminal subscription until `predicate` matches the decoded transcript
-/// (or the deadline hits).
 async fn drain_until(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalEvent>,
     events: &mut Vec<TerminalEvent>,
@@ -105,10 +95,6 @@ async fn drain_until(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Repos
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn repos_round_trip_add_branches_worktrees() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -116,7 +102,6 @@ async fn repos_round_trip_add_branches_worktrees() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // Add + list.
     let repo = repos
         .add(&repo_dir.to_string_lossy())
         .await
@@ -127,7 +112,6 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].path, repo_dir.to_string_lossy());
 
-    // Re-add dedupes; junk paths fail.
     repos
         .add(&repo_dir.to_string_lossy())
         .await
@@ -141,13 +125,11 @@ async fn repos_round_trip_add_branches_worktrees() {
         "non-repo dir rejected"
     );
 
-    // Branch listing: default branch first.
     git(&repo_dir, &["branch", "feature/x"]).await;
     let branches = repos.branches(&repo_dir).await.expect("branches");
     assert_eq!(branches[0], "main", "default branch first: {branches:?}");
     assert!(branches.contains(&"feature/x".to_string()));
 
-    // Worktree add: zeron/<name> branch, isolated dir under the test root.
     let worktree = repos
         .create_worktree(&repo_dir, "main")
         .await
@@ -170,18 +152,12 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("branches after worktree");
     assert!(branches.contains(&worktree.branch));
 
-    // Refs carry checkout state: `main` is current (main folder), the
-    // worktree's zeron/<name> branch maps to its linked-checkout path, and
-    // a plain branch has neither.
     let refs = repos.refs(&repo_dir).await.expect("refs");
     let by_name = |name: &str| refs.iter().find(|r| r.name == name).expect("ref row");
     assert!(
         by_name("main").current,
         "main is the main checkout: {refs:?}"
     );
-    // macOS exposes /var through the /private/var symlink, while Git reports
-    // the canonical worktree path. Compare canonical paths so the assertion
-    // is stable across platforms and temporary-directory roots.
     let listed_worktree_path = by_name(&worktree.branch)
         .worktree_path
         .as_deref()
@@ -195,7 +171,6 @@ async fn repos_round_trip_add_branches_worktrees() {
     let plain_ref = by_name("feature/x");
     assert!(!plain_ref.current && plain_ref.worktree_path.is_none());
 
-    // Worktree checkout identity differs from the main checkout's.
     let main_identity = repos
         .checkout_identity(&repo_dir)
         .await
@@ -206,7 +181,6 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("wt identity");
     assert_ne!(main_identity.id, wt_identity.id);
 
-    // Delete: dir removed, zeron branch removed, refs pruned.
     repos
         .delete_worktree(&repo_dir, Path::new(&worktree.path))
         .await
@@ -221,7 +195,6 @@ async fn repos_round_trip_add_branches_worktrees() {
         "zeron branch deleted: {branches:?}"
     );
 
-    // CreateRepo: sanitized name, initialized on main.
     let created = repos.create("demo repo!").await.expect("create repo");
     assert_eq!(created.name, "demo-repo-");
     assert!(PathBuf::from(&created.path).join(".git").exists());
@@ -351,10 +324,6 @@ async fn fetch_all_updates_only_remote_tracking_refs() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Folder lister
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn folder_lister_flags_and_ordering() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -363,7 +332,6 @@ async fn folder_lister_flags_and_ordering() {
     std::fs::create_dir_all(tmp.path().join(".hidden")).expect("hidden dir");
     std::fs::write(tmp.path().join("aaa.txt"), "x").expect("file");
 
-    // Data dir OUTSIDE the listed directory so the fixture stays exact.
     let data = tempfile::tempdir().expect("data dir");
     let repos = test_repos(data.path());
     let listing = repos
@@ -372,7 +340,6 @@ async fn folder_lister_flags_and_ordering() {
         .expect("listing");
     assert!(!listing.truncated);
     let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-    // Dirs first (name-sorted), files after; dotfiles hidden.
     assert_eq!(names, vec!["alpha", "beta", "aaa.txt"]);
     let beta = listing
         .entries
@@ -418,7 +385,7 @@ async fn folder_lister_timeout_path() {
         .list_folders_with(
             Some(tmp.path().to_string_lossy().to_string()),
             Duration::from_millis(50),
-            true, // worker never responds
+            true,
         )
         .await
         .expect_err("times out");
@@ -428,10 +395,6 @@ async fn folder_lister_timeout_path() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Diff capture
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn diff_capture_tracked_untracked_and_checksum() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -439,7 +402,6 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // Clean tree: empty patch, no files, stable checksum.
     let clean = capture_diff(&repos, &repo_dir)
         .await
         .expect("clean capture");
@@ -449,7 +411,6 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     assert_eq!(clean.branch, "main");
     assert!(clean.head_sha.is_some());
 
-    // Modify tracked + add untracked.
     std::fs::write(repo_dir.join("a.txt"), "one\nTWO\nthree\n").expect("modify a.txt");
     std::fs::write(repo_dir.join("b.txt"), "brand new\nline two\n").expect("untracked b.txt");
     let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
@@ -480,7 +441,6 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     assert_eq!(b.additions, 2);
     assert!(snapshot.additions >= 4);
 
-    // Checksum: stable across identical captures, changed by any edit.
     let again = capture_diff(&repos, &repo_dir).await.expect("recapture");
     assert_eq!(
         snapshot.checksum, again.checksum,
@@ -500,19 +460,16 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // Branch off, commit a change, then edit the working tree on top.
     git(&repo_dir, &["checkout", "-b", "feature"]).await;
     std::fs::write(repo_dir.join("c.txt"), "committed on feature\n").expect("write c.txt");
     git(&repo_dir, &["add", "."]).await;
     git(&repo_dir, &["commit", "-m", "feature work"]).await;
     std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nuncommitted\n").expect("edit a.txt");
 
-    // Working-tree capture sees only the uncommitted edit.
     let working = capture_diff(&repos, &repo_dir).await.expect("working");
     assert!(working.patch.contains("+uncommitted"));
     assert!(!working.patch.contains("committed on feature"));
 
-    // Branch capture (vs merge-base with main) sees the commit AND the edit.
     let base = merge_base(&repo_dir, "main").await.expect("merge base");
     let branch = capture_diff_against(&repos, &repo_dir, Some(&base))
         .await
@@ -521,7 +478,6 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
     assert!(branch.patch.contains("+uncommitted"));
     assert!(branch.files.iter().any(|f| f.path == "c.txt"));
 
-    // Unknown ref errors instead of silently falling back.
     assert!(merge_base(&repo_dir, "no-such-ref").await.is_err());
 }
 
@@ -572,7 +528,6 @@ async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // A second commit plus an uncommitted edit on top.
     std::fs::write(repo_dir.join("c.txt"), "second commit\n").expect("write c.txt");
     git(&repo_dir, &["add", "."]).await;
     git(&repo_dir, &["commit", "-m", "second"]).await;
@@ -582,14 +537,12 @@ async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
     let snapshot = capture_commit_diff(&repos, &repo_dir, &head)
         .await
         .expect("commit capture");
-    // Only the commit's own change — never the working tree on top.
     assert!(snapshot.patch.contains("+second commit"));
     assert!(!snapshot.patch.contains("uncommitted"));
     assert_eq!(snapshot.files.len(), 1);
     assert_eq!(snapshot.files[0].path, "c.txt");
     assert_eq!(snapshot.head_sha.as_deref(), Some(head.as_str()));
 
-    // The root commit diffs against the empty tree instead of erroring.
     let root = git_stdout(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]).await;
     let root_snapshot = capture_commit_diff(&repos, &repo_dir, &root)
         .await
@@ -604,20 +557,16 @@ async fn turn_diff_captures_only_changes_since_snapshot() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // Pre-turn state: a tracked edit and an untracked file already exist.
     std::fs::write(repo_dir.join("a.txt"), "one\ntwo\npre-turn\n").expect("edit a.txt");
     std::fs::write(repo_dir.join("pre.txt"), "before the turn\n").expect("pre.txt");
     let turn_tree = snapshot_tree(&repo_dir).await.expect("snapshot");
 
-    // Nothing changed yet: the turn diff is empty (pre-existing untracked
-    // files must NOT reappear as new).
     let clean = capture_turn_diff(&repos, &repo_dir, &turn_tree)
         .await
         .expect("clean turn diff");
     assert!(clean.patch.is_empty(), "unexpected: {}", clean.patch);
     assert!(clean.files.is_empty());
 
-    // The "turn" edits one file and adds another.
     std::fs::write(
         repo_dir.join("pre.txt"),
         "before the turn\nedited in turn\n",
@@ -650,8 +599,6 @@ async fn diff_capture_truncates_at_patch_cap() {
     init_repo(&repo_dir).await;
     let repos = test_repos(&tmp.path().join("data"));
 
-    // Rewrite the tracked file with >3MiB of fresh lines: the tracked patch blows
-    // through MAX_PATCH_BYTES and must come back truncated with the marker.
     let mut big = String::with_capacity(4 * 1024 * 1024 + 16);
     for i in 0..200_000 {
         big.push_str(&format!("line number {i} padded\n"));
@@ -663,10 +610,6 @@ async fn diff_capture_truncates_at_patch_cap() {
     assert!(snapshot.patch.contains("# Zeron diff truncated"));
 }
 
-// ---------------------------------------------------------------------------
-// Spaces sync (git presence stamping + orphan sweep) via EngineCore
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -674,7 +617,6 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     std::fs::create_dir_all(&folder).expect("folder");
 
     let core = assemble(&tmp.path().join("data"));
-    // Seeded as git (a lying picker) — the owner's sync must correct it.
     core.workspace
         .create_space(
             "space-1",
@@ -706,7 +648,6 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     assert!(!space.git_detected, "plain folder must read as non-git");
     assert!(space.checkout_id.is_none());
 
-    // `git init` later flips the stamp (watcher and/or explicit recheck).
     git(&folder, &["init", "-b", "main"]).await;
     core.spaces_sync.reconcile_now().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -762,10 +703,6 @@ async fn delete_space_cascades_chats_and_sessions() {
     core.shutdown().await;
 }
 
-// ---------------------------------------------------------------------------
-// Diff sync (watchers + workspace branch upkeep) via EngineCore
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_sync_publishes_and_updates_chat_branch() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -788,7 +725,6 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
         .expect("chat row");
     core.diff_sync.reconcile_now().await;
 
-    // Initial snapshot lands after the debounce; poll the watch.
     let mut diffs_rx = core.diff_sync.watch_diffs();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let diff = loop {
@@ -808,7 +744,6 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     assert!(!diff.checkout_id.is_empty());
     assert!(!diff.checksum.is_empty());
 
-    // Row upkeep: branch + checkoutId stamped on the workspace chat row.
     let chat = core
         .workspace
         .chat("chat-diff")
@@ -817,10 +752,6 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     assert_eq!(chat.branch.as_deref(), Some("main"));
     assert_eq!(chat.checkout_id.as_deref(), Some(diff.checkout_id.as_str()));
 
-    // File watcher path: another edit re-publishes without a manual kick.
-    // Normally the watcher carries this in a debounce; FSEvents is allowed to
-    // drop events, and a dropped one converges only on the repair tick, so the
-    // deadline clears REPAIR_INTERVAL rather than reading loss as failure.
     let before = diff.checksum.clone();
     std::fs::write(repo_dir.join("watched.txt"), "fresh untracked\n").expect("new file");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
@@ -892,7 +823,6 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
     git(&repo_dir, &["commit", "-m", "second"]).await;
     let sha = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
 
-    // A live edit must not affect the immutable History diff source pair.
     std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nworking tree edit\n")
         .expect("working tree content");
 
@@ -933,10 +863,6 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
     core.shutdown().await;
 }
 
-// ---------------------------------------------------------------------------
-// Terminals
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_e2e_replay_live_resize_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -947,7 +873,6 @@ async fn terminal_e2e_replay_live_resize_exit() {
     assert_eq!(session.shell, "sh");
     assert_eq!(session.cwd, tmp.path().to_string_lossy());
 
-    // Live subscribe, then run a command whose OUTPUT differs from the echoed input.
     let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
     let mut events = Vec::new();
     terminals
@@ -958,13 +883,11 @@ async fn terminal_e2e_replay_live_resize_exit() {
     })
     .await;
 
-    // Resize is accepted (values clamped internally).
     terminals.resize(&session.id, 132, 40).expect("resize");
     terminals
         .resize(&session.id, 1, 1000)
         .expect("clamped resize");
 
-    // Detach (drop the stream) — the shell survives and keeps producing output.
     drop(rx);
     terminals
         .write(&session.id, &BASE64.encode("echo aft3r-$((10+1))\n"))
@@ -978,13 +901,11 @@ async fn terminal_e2e_replay_live_resize_exit() {
         text.contains("m4rk3r-42") && text.contains("aft3r-11")
     })
     .await;
-    // The replay was re-delivered from seq 0 — first event seq is 1.
     let first_seq = match events2.first().expect("replayed events") {
         TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
     };
     assert_eq!(first_seq, 1);
 
-    // afterSeq resume skips already-seen events.
     let last_seen = match events2.last().expect("events") {
         TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
     };
@@ -992,7 +913,6 @@ async fn terminal_e2e_replay_live_resize_exit() {
         .subscribe(&session.id, Some(last_seen))
         .expect("resume");
 
-    // Exit: shell terminates, Exit event lands on every live stream, streams end.
     terminals
         .write(&session.id, &BASE64.encode("exit 3\n"))
         .expect("write exit");
@@ -1009,7 +929,6 @@ async fn terminal_e2e_replay_live_resize_exit() {
     }
     assert!(rx3.recv().await.is_none(), "stream ends after exit");
 
-    // Exited-session replay: subscribe again → full replay then immediate end.
     let mut rx4 = terminals
         .subscribe(&session.id, None)
         .expect("post-exit subscribe");
@@ -1023,7 +942,6 @@ async fn terminal_e2e_replay_live_resize_exit() {
         Some(TerminalEvent::Exit { exit_code: 3, .. })
     ));
 
-    // Writes to an exited terminal fail; close removes it entirely.
     assert!(
         terminals
             .write(&session.id, &BASE64.encode("nope\n"))
@@ -1057,20 +975,13 @@ async fn terminal_guards_input_size_and_cwd() {
     terminals.close(&session.id).expect("close");
 }
 
-// ---------------------------------------------------------------------------
-// RPC dispatch over the in-memory transport
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_dispatch_for_m5_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // EngineCore's Repos resolves the worktree root from the env; keep test
-    // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
     unsafe { std::env::set_var("ZERON_WORKTREES_DIR", tmp.path().join("worktrees")) };
     let core = assemble(&tmp.path().join("data"));
     let client = zeron_rpc::memory_client(core.rpc_service());
 
-    // CreateRepo → ListRepos.
     let created = client
         .call(methods::CREATE_REPO, serde_json::json!({ "name": "demo" }))
         .await
@@ -1083,21 +994,17 @@ async fn rpc_dispatch_for_m5_methods() {
         .expect("ListRepos");
     assert_eq!(listed.as_array().map(Vec::len), Some(1));
 
-    // AddRepo (idempotent re-add of the same path).
     let added = client
         .call(methods::ADD_REPO, serde_json::json!({ "path": repo_path }))
         .await
         .expect("AddRepo");
     assert_eq!(added["name"], "demo");
 
-    // Seed a commit so branches/worktrees exist.
     let repo_dir = PathBuf::from(&repo_path);
     std::fs::write(repo_dir.join("file.txt"), "hello\n").expect("seed file");
     git(&repo_dir, &["add", "."]).await;
     git(&repo_dir, &["commit", "-m", "seed"]).await;
 
-    // SearchFiles resolves both space and chat roots, while rejecting a chat
-    // whose cwd was retargeted outside the owning repository.
     core.workspace
         .create_space("space-term", &core.device_id, &repo_path, None, true)
         .expect("search space");
@@ -1156,7 +1063,6 @@ async fn rpc_dispatch_for_m5_methods() {
         "chat cwd must stay inside its workspace checkout"
     );
 
-    // ListBranches: default (checked-out) branch first.
     let branches = client
         .call(
             methods::LIST_BRANCHES,
@@ -1166,7 +1072,6 @@ async fn rpc_dispatch_for_m5_methods() {
         .expect("ListBranches");
     assert_eq!(branches[0], "main");
 
-    // ListFolders with an explicit path.
     let folders = client
         .call(
             methods::LIST_FOLDERS,
@@ -1180,7 +1085,6 @@ async fn rpc_dispatch_for_m5_methods() {
         Some(&*tmp.path().to_string_lossy())
     );
 
-    // CreateWorktree / DeleteWorktree.
     let worktree = client
         .call(
             methods::CREATE_WORKTREE,
@@ -1209,7 +1113,6 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(deleted["ok"], true);
     assert!(!PathBuf::from(&worktree_path).exists());
 
-    // WatchCheckoutDiffs: streams the current (empty) diff set immediately.
     let mut diffs_stream = client
         .subscribe(methods::WATCH_CHECKOUT_DIFFS, serde_json::Value::Null)
         .await
@@ -1220,7 +1123,6 @@ async fn rpc_dispatch_for_m5_methods() {
         .expect("stream alive");
     assert!(first.is_array());
 
-    // Terminals: the chat's cwd (via its space) becomes the PTY cwd.
     client
         .call(
             methods::MUTATE,

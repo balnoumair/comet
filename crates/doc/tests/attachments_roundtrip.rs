@@ -1,6 +1,3 @@
-//! Round 17 probe: RunRequest.attachments must survive the command ledger's
-//! loro round trip.
-
 use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus, SessionDoc};
 
 #[test]

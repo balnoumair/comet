@@ -1,16 +1,3 @@
-//! zeron-rpc — the typed local control plane over WebSocket and in-memory transports.
-//!
-//! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of zeron's Effect RPC without the Effect runtime:
-//!
-//! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
-//! - server → client: `{id, ok}` / `{id, err}` for unary calls,
-//!   `{id, item}`* then `{id, done: true}` (or `{id, err}`) for streams.
-//!
-//! The server dispatches into an [`RpcService`]; the [`RpcClient`] offers `call` and
-//! `subscribe`. Both ends run over any pair of string channels, so the in-memory transport
-//! ([`memory_client`]) exercises the exact same code path as the WebSocket one.
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,12 +10,8 @@ mod server;
 pub use client::{RpcClient, connect_ws};
 pub use server::{serve_connection, serve_ws_listener};
 
-/// RPC method names — single source of truth for both ends.
-/// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
-    /// Flip a harness's enablement on the target device (Settings → Agents);
-    /// replies with the device's fresh `ListHarnesses` catalog.
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
@@ -37,22 +20,11 @@ pub mod methods {
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
-    /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
-    /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
-    /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
-    /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
-    /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
-    /// Readiness barrier for the engine runtime. The call completes once stores
-    /// and journals are assembled, or fails with the assembly error.
     pub const ENGINE_READY: &str = "EngineReady";
-    /// Ask a headless IPC owner to drain its runtime and exit successfully.
-    /// Headed IPC owners do not implement this method: closing another app's
-    /// engine behind its windows would leave that process unusable.
     pub const STOP_ENGINE: &str = "StopEngine";
-    // Repos / worktrees / folders.
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
     pub const CLONE_REPO: &str = "CloneRepo";
@@ -60,25 +32,20 @@ pub mod methods {
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
     pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
-    /// Update remote-tracking refs without changing HEAD, the index, or files.
     pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
-    /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
-    // Terminals (SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
-    /// Checkout-diff stream for this engine's chats.
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
-    // Agent accounts (CLI logins are local to this installation).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
     pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
@@ -86,13 +53,9 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
-    // Uploads / attachments (stored locally).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    // Account/organization method names retained as inert protocol
-    // identifiers: hosts still reference them, but the local engine implements
-    // no cloud auth or profile-import operation behind any of them.
     pub const AUTH_STATUS: &str = "AuthStatus";
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
@@ -119,7 +82,6 @@ pub enum RpcError {
     Closed,
 }
 
-/// A client-originated frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientFrame {
     pub id: u64,
@@ -131,7 +93,6 @@ pub struct ClientFrame {
     pub cancel: bool,
 }
 
-/// A server-originated frame. Exactly one of `ok` / `err` / `item` / `done` is meaningful.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerFrame {
     pub id: u64,
@@ -145,16 +106,12 @@ pub struct ServerFrame {
     pub done: bool,
 }
 
-/// What a service returns for one invocation.
 pub enum RpcReply {
-    /// Unary response — sent as `{id, ok}`.
     Value(serde_json::Value),
-    /// Stream — each item sent as `{id, item}`, then `{id, done: true}` when it ends.
     Stream(BoxStream<'static, serde_json::Value>),
 }
 
 impl RpcReply {
-    /// Serialize a value into a unary reply.
     pub fn value<T: Serialize>(value: &T) -> Result<Self, RpcError> {
         serde_json::to_value(value)
             .map(RpcReply::Value)
@@ -162,22 +119,17 @@ impl RpcReply {
     }
 }
 
-/// Server-side dispatch: one implementation serves every transport.
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
 }
 
-/// Deserialize typed params out of the envelope's `params` value.
 pub fn parse_params<T: serde::de::DeserializeOwned>(
     params: serde_json::Value,
 ) -> Result<T, RpcError> {
     serde_json::from_value(params).map_err(|e| RpcError::BadParams(e.to_string()))
 }
 
-/// Spawn an in-memory server for `service` and return a connected client.
-/// Same envelopes, same dispatch loop as the WebSocket path — an in-process host
-/// transport (ARCHITECTURE §1 "zero serialization shortcuts").
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
@@ -278,8 +230,6 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
 
-        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
-        // the server must refuse the handshake before serving any RPC.
         let mut req = format!("ws://127.0.0.1:{port}")
             .into_client_request()
             .unwrap();
@@ -291,8 +241,6 @@ mod tests {
             "handshake carrying an Origin header must be rejected"
         );
 
-        // A native host (no Origin) still connects and can call RPC — the
-        // reject must not be a blanket denial.
         let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
         let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
         assert_eq!(echoed, serde_json::json!("ok"));
@@ -306,7 +254,6 @@ mod tests {
             .await
             .unwrap();
         drop(items);
-        // The next unary call still works — the dead stream didn't wedge the connection.
         let echoed = client.call("Echo", serde_json::json!(2)).await.unwrap();
         assert_eq!(echoed, serde_json::json!(2));
     }

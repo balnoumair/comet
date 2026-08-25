@@ -1,15 +1,3 @@
-//! Repos — this device's git repositories, branches, worktrees, and the folder
-//! browser (feature-inventory §3.5; port of zeron's `repos.ts` + `folder-lister.ts`).
-//!
-//! Repos are device-local (paths differ per machine), so the known set is a plain
-//! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
-//! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
-//! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
-//!
-//! All git access is via subprocess (`tokio::process`) — never libgit2.
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,17 +12,10 @@ use zeron_proto::{
 
 use crate::EngineError;
 
-/// Existence probe timeout for user-chosen / remembered paths, which can point at
-/// dead network mounts where a bare `stat` hangs for minutes.
 const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
-/// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
-/// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
-/// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
-/// File mentions should remain responsive even in very large checkouts.
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
-/// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_INDEX_TTL: Duration = Duration::from_secs(10);
 const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
@@ -51,18 +32,13 @@ const NOUNS: &[&str] = &[
     "onyx", "quartz", "raven", "summit", "willow", "aspen",
 ];
 
-/// Canonical identity shared by every chat operating in this exact worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutIdentity {
-    /// `sha256(deviceId ‖ NUL ‖ canonical git dir)` — device-scoped, path-stable.
     pub id: String,
-    /// Canonical worktree root (`rev-parse --show-toplevel`, symlinks resolved).
     pub root: PathBuf,
-    /// Canonical git dir (worktree-specific for linked worktrees).
     pub git_dir: PathBuf,
 }
 
-/// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
@@ -75,9 +51,6 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
-/// (test isolation); empty reads as unset.
 fn default_worktrees_root() -> PathBuf {
     std::env::var_os("ZERON_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
@@ -112,13 +85,10 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
     }
 
-    /// Explicit worktree root (tests).
     pub fn with_worktrees_root(data_dir: &Path, device_id: &str, worktrees_root: PathBuf) -> Self {
         Self {
             inner: std::sync::Arc::new(ReposInner {
@@ -130,8 +100,6 @@ impl Repos {
             }),
         }
     }
-
-    // ── registry (repos.json) ───────────────────────────────────────────────
 
     fn registry_path(&self) -> PathBuf {
         self.inner.data_dir.join("repos.json")
@@ -160,9 +128,6 @@ impl Repos {
         self.save_paths(&paths)
     }
 
-    // ── git plumbing ────────────────────────────────────────────────────────
-
-    /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args);
@@ -190,8 +155,6 @@ impl Repos {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Async existence probe with a timeout: a wedged network mount just reads
-    /// as "gone" instead of hanging every caller.
     async fn path_exists(path: &Path) -> bool {
         let path = path.to_path_buf();
         matches!(
@@ -200,7 +163,6 @@ impl Repos {
         )
     }
 
-    /// Is `path` inside a git work tree? (Also the SpacesSync git-presence probe.)
     pub async fn is_repo(&self, path: &Path) -> bool {
         matches!(
             self.git(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
@@ -208,7 +170,6 @@ impl Repos {
         )
     }
 
-    /// The branch currently checked out at a repo/worktree path (`"HEAD"` when detached).
     pub async fn current_branch(&self, path: &Path) -> Result<String, EngineError> {
         let branch = self.git(&["branch", "--show-current"], Some(path)).await?;
         Ok(if branch.is_empty() {
@@ -218,15 +179,12 @@ impl Repos {
         })
     }
 
-    /// Fetch every configured remote without pruning or integrating anything
-    /// into the active branch. This intentionally updates refs only.
     pub async fn fetch_all(&self, repo_path: &Path) -> Result<(), EngineError> {
         self.git(&["fetch", "--all", "--quiet"], Some(repo_path))
             .await
             .map(drop)
     }
 
-    /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
     pub async fn git_head_path(&self, path: &Path) -> Result<PathBuf, EngineError> {
         let git_dir = self
             .git(&["rev-parse", "--absolute-git-dir"], Some(path))
@@ -234,8 +192,6 @@ impl Repos {
         Ok(PathBuf::from(git_dir).join("HEAD"))
     }
 
-    /// Canonical identity shared by every chat operating in this exact worktree:
-    /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
         let root = self
             .git(&["rev-parse", "--show-toplevel"], Some(path))
@@ -273,10 +229,6 @@ impl Repos {
         })
     }
 
-    // ── ListRepos / AddRepo / CloneRepo / CreateRepo ────────────────────────
-
-    /// Known repos that still exist, each with its current branch. Never fails:
-    /// vanished paths and non-repos are silently dropped.
     pub async fn list(&self) -> Vec<Repo> {
         let mut repos = Vec::new();
         for path in self.load_paths() {
@@ -294,7 +246,6 @@ impl Repos {
         repos
     }
 
-    /// Remember an existing repository the user pointed us at.
     pub async fn add(&self, path: &str) -> Result<Repo, EngineError> {
         let abs = absolutize(Path::new(path));
         if !Self::path_exists(&abs).await {
@@ -313,8 +264,6 @@ impl Repos {
         self.to_repo(&abs).await
     }
 
-    /// `git clone <url>` under `{data_dir}/repos`. (Named `clone_repo` to keep
-    /// `Clone::clone` unambiguous on the service handle.)
     pub async fn clone_repo(&self, url: &str) -> Result<Repo, EngineError> {
         let trimmed = url.trim().trim_end_matches('/');
         let name = trimmed
@@ -339,7 +288,6 @@ impl Repos {
         self.to_repo(&target).await
     }
 
-    /// `git init -b main` a fresh repository under `{data_dir}/repos`.
     pub async fn create(&self, name: &str) -> Result<Repo, EngineError> {
         let clean: String = name
             .trim()
@@ -368,10 +316,6 @@ impl Repos {
         self.to_repo(&target).await
     }
 
-    // ── branches ────────────────────────────────────────────────────────────
-
-    /// All branches (`git branch -a`), local first, deduped against their remote
-    /// counterparts, with the repo's default branch first.
     pub async fn branches(&self, repo_path: &Path) -> Result<Vec<String>, EngineError> {
         let out = self
             .git(&["branch", "-a", "--format=%(refname)"], Some(repo_path))
@@ -383,7 +327,6 @@ impl Repos {
                 names.push(name.to_string());
             }
         };
-        // Locals first, then remote-only branches (stripped of their remote prefix).
         for line in out.lines().map(str::trim) {
             if let Some(local) = line.strip_prefix("refs/heads/") {
                 push(local);
@@ -396,7 +339,6 @@ impl Repos {
                 push(name);
             }
         }
-        // Default branch first: origin/HEAD's target, else the checked-out branch.
         let default = match self
             .git(
                 &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -424,16 +366,9 @@ impl Repos {
         Ok(names)
     }
 
-    /// [`Self::branches`] enriched with checkout state: which branch the MAIN
-    /// folder has checked out (`current`) and which branches are materialized
-    /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
-    /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
         let names = self.branches(repo_path).await?;
         let current = self.current_branch(repo_path).await.ok();
-        // `git worktree list --porcelain`: stanzas of `worktree <path>` /
-        // `HEAD <sha>` / `branch refs/heads/<name>`. The first stanza is the
-        // main checkout — excluded (it's `current`, not a linked worktree).
         let mut worktrees: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         if let Ok(out) = self
@@ -445,7 +380,6 @@ impl Repos {
             for line in out.lines().map(str::trim) {
                 if let Some(p) = line.strip_prefix("worktree ") {
                     stanza += 1;
-                    // The first stanza is the main checkout, not a linked tree.
                     path = (stanza > 1).then(|| p.to_string());
                 } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
                     && let Some(path) = path.take()
@@ -464,9 +398,6 @@ impl Repos {
             .collect())
     }
 
-    /// Public commit history in topological order. Only user-facing branches,
-    /// remotes, and tags seed the walk, so Zeron's internal refs never leak
-    /// into the graph or keep otherwise-unreachable checkpoints visible.
     pub async fn history(
         &self,
         repo_path: &Path,
@@ -557,9 +488,6 @@ impl Repos {
         })
     }
 
-    /// Whether `candidate` is the repository root or one of its linked
-    /// worktrees. Filesystem resolution happens on a disposable thread because
-    /// user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
@@ -582,12 +510,6 @@ impl Repos {
         .flatten()
     }
 
-    /// Switch the checkout at `cwd` (a main folder OR a linked worktree) to
-    /// `ref_name` — the t3code `switchRef` port: an existing local branch is
-    /// checked out directly; a remote-only branch gets a local tracking
-    /// branch (`checkout --track origin/<ref>`). A dirty tree or a branch
-    /// already checked out in another worktree fails with git's own message.
-    /// Returns the resulting current branch.
     pub async fn switch_ref(&self, cwd: &Path, ref_name: &str) -> Result<String, EngineError> {
         let local = self
             .git(
@@ -621,7 +543,6 @@ impl Repos {
                 self.git(&["checkout", "--track", &remote], Some(cwd))
                     .await?;
             } else {
-                // Unknown ref: let git produce the authoritative error.
                 self.git(&["checkout", ref_name], Some(cwd)).await?;
             }
         }
@@ -629,11 +550,6 @@ impl Repos {
         Ok(out.trim().to_string())
     }
 
-    // ── worktrees ───────────────────────────────────────────────────────────
-
-    /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `zeron/<name>`
-    /// branch off `branch`.
     pub async fn create_worktree(
         &self,
         repo_path: &Path,
@@ -645,7 +561,6 @@ impl Repos {
             .unwrap_or_else(|| "repo".to_string());
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
-        // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
             .branches(repo_path)
             .await
@@ -710,15 +625,6 @@ impl Repos {
         .is_ok()
     }
 
-    /// Rename a zeron-created worktree branch after its chat's generated title
-    /// (port of zeron's `renameWorktreeBranch`). Guards:
-    /// - respect an external checkout/rename: only act while the worktree is still
-    ///   on `expected_branch` AND that branch is the original `zeron/<folderName>`;
-    /// - a title-slug collision gets a stable 6-hex suffix (hash of the worktree
-    ///   path); a collision on THAT too fails.
-    ///
-    /// Returns the branch the worktree ends up on (re-read after the rename so a
-    /// concurrent external checkout always wins the metadata race).
     pub async fn rename_worktree_branch(
         &self,
         worktree_path: &Path,
@@ -758,9 +664,6 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
-    /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) — the
-    /// user may have checked out their own branch inside the worktree.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
@@ -784,7 +687,6 @@ impl Repos {
                 )
                 .await;
             if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
                 let _ = std::fs::remove_dir_all(worktree_path);
             }
         }
@@ -795,21 +697,11 @@ impl Repos {
         Ok(())
     }
 
-    // ── ListFolders ─────────────────────────────────────────────────────────
-
-    /// One directory level (home by default): dotfiles hidden, directories first,
-    /// capped at [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. The walk runs
-    /// in a spawned blocking task under a 6s wall-clock ceiling — a wedged path
-    /// (dead mount, permission-gated folder) fails this listing without blocking
-    /// anything else; the abandoned task unwinds on its own thread.
     pub async fn list_folders(&self, path: Option<String>) -> Result<FolderListing, EngineError> {
         self.list_folders_with(path, FOLDER_LIST_TIMEOUT, false)
             .await
     }
 
-    /// Search a checkout's files and directories by fuzzy relative path. The
-    /// `ignore` walker honors `.gitignore`, `.ignore`, and global git excludes.
-    /// Dotfiles remain searchable; only repository metadata is always pruned.
     pub async fn search_files(
         &self,
         root: PathBuf,
@@ -859,13 +751,6 @@ impl Repos {
         }
     }
 
-    /// `hang_for_test` makes the worker never respond — exercises the timeout path.
-    ///
-    /// The walk runs on a DETACHED OS thread (not the tokio blocking pool): a
-    /// readdir wedged in the kernel can't be cancelled, and a poisoned blocking
-    /// pool — or a runtime shutdown waiting on it — must never be possible. On
-    /// timeout the thread is simply abandoned (the zeron backend's disposable
-    /// worker, minus the terminate()).
     #[doc(hidden)]
     pub async fn list_folders_with(
         &self,
@@ -882,8 +767,6 @@ impl Repos {
             .name("folder-list".into())
             .spawn(move || {
                 if hang_for_test {
-                    // Hold the sender without responding (detached thread; process
-                    // exit reclaims it) — the caller must hit its timeout.
                     std::thread::sleep(Duration::from_secs(3600));
                 }
                 let _ = tx.send(list_folders_blocking(&target));
@@ -923,8 +806,6 @@ async fn disposable_worker<T: Send + 'static>(
     rx.await.ok()
 }
 
-/// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
-/// existence probe per directory entry.
 fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
@@ -946,7 +827,6 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
             is_repo,
         });
     }
-    // Directories first, each group name-sorted (case-insensitive).
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
@@ -1203,15 +1083,11 @@ fn rank_file_matches(
         .collect()
 }
 
-/// Turn a generated chat title into the semantic portion of a Zeron branch
-/// (port of zeron's `worktreeBranchFromTitle`). Zeron NFKD-normalizes accented
-/// letters first; native keeps it ASCII-only (generated titles are Title Case
-/// English), so non-ASCII characters collapse into the `-` separator.
 pub fn worktree_branch_from_title(title: &str) -> String {
     let mut slug = String::new();
     for c in title.trim().chars() {
         if matches!(c, '\'' | '"' | '`') {
-            continue; // dropped entirely (cafe's → cafes), not a separator
+            continue;
         }
         if c.is_ascii_alphanumeric() {
             slug.push(c.to_ascii_lowercase());
@@ -1316,7 +1192,6 @@ fn parse_history_refs(output: &str) -> HashMap<String, Vec<GitHistoryRef>> {
     refs_by_sha
 }
 
-/// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()

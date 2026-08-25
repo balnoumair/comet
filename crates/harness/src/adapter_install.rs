@@ -1,29 +1,9 @@
-//! Managed installs for npm-distributed ACP adapters.
-//!
-//! The old fallback spawned `npx -y <pkg>` at chat time, which put every
-//! user's npm state in the hot path: a cold cache meant a multi-minute
-//! download while the chat showed "Working", and a broken one meant npm dying
-//! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT, the zeronsh/comet#95 crash) that surfaced as an opaque
-//! "harness protocol error". Instead, pinned adapter packages are installed
-//! ONCE into a zeron-owned prefix (`~/.zeron/adapters/<pkg>/<version>`, own
-//! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
-//! us), and every subsequent launch spawns `node <entry>` directly — no npm
-//! anywhere near a chat turn.
-//!
-//! Install is atomic: npm runs in a `.tmp-*` sibling which is renamed into
-//! place only after the bin entry resolves and a marker file is written, so a
-//! killed install can never masquerade as a working adapter, and concurrent
-//! installers (two daemons, prewarm racing a run) converge on whichever
-//! rename won.
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use crate::HarnessError;
 
-/// A pinned npm package: `"@scope/name@1.2.3"` → name + version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NpmPin {
     pub name: &'static str,
@@ -31,8 +11,6 @@ pub(crate) struct NpmPin {
 }
 
 impl NpmPin {
-    /// Split a `name@version` pin at the LAST `@` (scoped names carry a
-    /// leading one).
     pub(crate) fn parse(pin: &'static str) -> Self {
         match pin.rfind('@') {
             Some(at) if at > 0 => Self {
@@ -50,7 +28,6 @@ impl NpmPin {
         format!("{}@{}", self.name, self.version)
     }
 
-    /// Filesystem-safe directory name (`@scope/name` → `scope__name`).
     fn dir_name(&self) -> String {
         self.name.trim_start_matches('@').replace('/', "__")
     }
@@ -59,7 +36,6 @@ impl NpmPin {
 const OK_MARKER: &str = ".zeron-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$ZERON_ADAPTERS_DIR`, else `~/.zeron/adapters`.
 fn adapters_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -73,8 +49,6 @@ fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
     adapters_root().map(|root| root.join(pin.dir_name()).join(pin.version))
 }
 
-/// The package's bin entry inside an install dir, from its own package.json
-/// (`bin` as a string, or a map preferring `bin_name`).
 fn bin_entry(dir: &Path, pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
     let pkg_dir = dir.join("node_modules").join(pin.name);
     let manifest: serde_json::Value =
@@ -92,7 +66,6 @@ fn bin_entry(dir: &Path, pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
     entry.exists().then_some(entry)
 }
 
-/// The bin entry of a COMPLETED managed install, `None` when absent.
 pub(crate) fn installed_entry(pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
     let dir = install_dir(pin)?;
     if !dir.join(OK_MARKER).exists() {
@@ -105,9 +78,6 @@ pub(crate) fn find_npm() -> Option<PathBuf> {
     crate::acp::find_on_paths("npm", Vec::new())
 }
 
-/// How to spawn an installed entry: JS entries (the overwhelming npm norm,
-/// shebang or not) run via `node`; a native binary published as a bin entry
-/// runs directly.
 pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), HarnessError> {
     let head = std::fs::read(entry)
         .ok()
@@ -119,8 +89,6 @@ pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), H
     if native {
         return Ok((entry.to_path_buf(), Vec::new()));
     }
-    // Prefer node beside npm (version managers keep them together); PATH and
-    // the login-shell snapshot cover the rest.
     let extra = find_npm()
         .and_then(|npm| npm.parent().map(|d| d.join("node")))
         .into_iter()
@@ -136,8 +104,6 @@ pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), H
     Ok((node, vec![entry.display().to_string()]))
 }
 
-/// npm encodes fatal fs errors as `256 - errno` (npm/cli#4838 — often with no
-/// stderr at all); name the ones users actually hit.
 fn describe_npm_exit(status: Option<std::process::ExitStatus>) -> String {
     let base = crate::describe_exit(status);
     let hint = match status.and_then(|s| s.code()) {
@@ -152,16 +118,11 @@ fn describe_npm_exit(status: Option<std::process::ExitStatus>) -> String {
     }
 }
 
-/// One installer at a time per process; installs are rare and npm handles
-/// its own intra-install parallelism.
 fn install_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Ensure the pinned package is installed; returns its bin entry. Failures
-/// carry npm's own output — the whole point is that a dying npm stops being
-/// an undiagnosable one-liner.
 pub(crate) async fn ensure_installed(
     pin: NpmPin,
     bin_name: &str,
@@ -210,8 +171,6 @@ pub(crate) async fn ensure_installed(
         std::fs::create_dir_all(parent)?;
     }
     if std::fs::rename(&tmp_dir, &final_dir).is_err() {
-        // Lost a cross-process race (or a stale dir): keep whatever is in
-        // place if it's complete, else replace it.
         if installed_entry(&pin, bin_name).is_none() {
             let _ = std::fs::remove_dir_all(&final_dir);
             std::fs::rename(&tmp_dir, &final_dir)?;
@@ -227,11 +186,6 @@ pub(crate) async fn ensure_installed(
     })
 }
 
-/// A zeron-owned shim script materialized INSIDE a managed install dir, for
-/// SDK packages with no bin entry (`@cursor/sdk`): the shim resolves the SDK
-/// from the sibling `node_modules`. Returns the shim path when the install is
-/// complete AND the shim contents match this build (a comet upgrade that
-/// changes the shim rewrites it in place).
 pub(crate) fn installed_shim(pin: &NpmPin, shim_name: &str, contents: &str) -> Option<PathBuf> {
     let dir = install_dir(pin)?;
     if !dir.join(OK_MARKER).exists() {
@@ -247,10 +201,6 @@ pub(crate) fn installed_shim(pin: &NpmPin, shim_name: &str, contents: &str) -> O
     }
 }
 
-/// Like [`ensure_installed`], for a package consumed as a LIBRARY by a
-/// zeron-owned shim rather than through a bin entry. Installs the pin once,
-/// writes `contents` as `<install-dir>/<shim_name>`, and returns the shim
-/// path (spawn it via [`launch_for_entry`]).
 pub(crate) async fn ensure_installed_shim(
     pin: NpmPin,
     display_name: &str,
@@ -294,8 +244,6 @@ pub(crate) async fn ensure_installed_shim(
         std::fs::create_dir_all(parent)?;
     }
     if std::fs::rename(&tmp_dir, &final_dir).is_err() {
-        // Lost a cross-process race (or a stale dir): keep whatever is in
-        // place if it's complete, else replace it.
         if !final_dir.join(OK_MARKER).exists() {
             let _ = std::fs::remove_dir_all(&final_dir);
             std::fs::rename(&tmp_dir, &final_dir)?;
@@ -321,7 +269,6 @@ async fn install_into(
     let _ = std::fs::remove_dir_all(tmp_dir);
     std::fs::create_dir_all(tmp_dir)?;
     std::fs::create_dir_all(cache_dir)?;
-    // A bare manifest keeps npm from walking up into a user project.
     std::fs::write(tmp_dir.join("package.json"), "{\"private\":true}\n")?;
     tracing::info!(
         target: "zeron_harness::adapter_install",
@@ -336,8 +283,6 @@ async fn install_into(
         "--no-fund",
         "--no-progress",
         "--loglevel=error",
-        // Defeat a user-level `omit=optional`: @openai/codex ships its
-        // platform binary as an optional dependency.
         "--include=optional",
         "--cache",
     ])
@@ -389,7 +334,6 @@ async fn install_into(
         output = out.trim().to_owned();
     }
     let tail: String = if output.len() > 1200 {
-        // npm front-loads "npm ERR!" lines; keep the tail where the cause lands.
         format!("…{}", &output[output.len() - 1200..])
     } else {
         output
@@ -465,7 +409,6 @@ mod tests {
             Some(pkg.join("dist.js"))
         );
 
-        // Marker gating: entry present but no marker → not installed.
         assert_eq!(
             install_dir(&pin).is_some(),
             std::env::var_os("HOME").is_some()

@@ -1,27 +1,3 @@
-//! OpenCode subagent visualization on the ACP path.
-//!
-//! opencode's `task` tool call rides the parent's `session/update` stream
-//! (kind `think`, `rawInput: {description, prompt, subagent_type}`), but the
-//! child session's interior transcript never appears on the ACP wire — the
-//! parent only sees the completion's `<task_result>` text. The transcript IS
-//! available live from the process itself: `opencode acp` always doubles as
-//! opencode's HTTP server (zeron passes `--port <free>` to dodge the shared
-//! default 4096, where a losing concurrent bind silently drops the server),
-//! and its `/event` SSE bus broadcasts every session's `session.created` /
-//! `message.updated` / `message.part.updated` / `message.part.delta` events —
-//! child sessions included, token-level (verified live, 1.18.18; storage
-//! moved to SQLite in 1.18, so there is no JSONL to tail grok-style).
-//!
-//! Correlation: a `task` tool call registers a pending chip; the bus's
-//! `session.created` for a child (`parentID` = the parent ACP session, title
-//! `"{description} (@{agent} subagent)"`) binds by description, else FIFO —
-//! and the task completion's `rawOutput.metadata.sessionId` is the
-//! authoritative late binding. The bound child's bus traffic maps to tagged
-//! [`AgentEvent::Subagent`] events; the ACP task completion settles the chip
-//! with a tagged Done (`task` runs synchronously — the child always finishes
-//! before its chip does). The bus is vendor-private: every parse fails soft,
-//! degrading to chip + final `<task_result>` output.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,15 +10,10 @@ use crate::HarnessError;
 
 use super::normalize::{OUTPUT_CAP, cap_text};
 
-/// Budget on the first `/event` connect: the server binds a few seconds into
-/// the process's life, well inside this window.
 const CONNECT_ATTEMPTS: u32 = 120;
 const CONNECT_POLL: Duration = Duration::from_millis(250);
-/// Grace between the ACP task completion and the tagged Done, letting the
-/// child's last bus frames (an independent channel) land in order.
 const SETTLE_DRAIN: Duration = Duration::from_millis(400);
 
-/// Wrap an event as subagent-attributed traffic.
 fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
     AgentEvent::Subagent {
         parent_tool_use_id: parent.to_owned(),
@@ -59,56 +30,38 @@ fn done(status: DoneStatus) -> AgentEvent {
     }
 }
 
-/// A `task` chip seen on the ACP wire, awaiting a child session.
 struct PendingSpawn {
     tool_call_id: String,
     description: String,
 }
 
-/// A bus `session.created` that arrived before any chip could be bound
-/// (defensive: the chip's rawInput update precedes tool execution today).
 struct UnboundChild {
     title: String,
 }
 
-/// What a bound child's bus traffic has produced so far.
 #[derive(Default)]
 struct ChildState {
-    /// The spawn chip this child streams to.
     parent_tool_use_id: String,
-    /// messageID → is-assistant (user prompt echoes must not render).
     assistant_messages: HashMap<String, bool>,
-    /// partID → streaming state (dedup between snapshots and deltas).
     parts: HashMap<String, PartState>,
-    /// Any transcript reached the doc — the completion fallback text would
-    /// only duplicate it.
     saw_transcript: bool,
-    /// Chip settled (tagged Done sent or scheduled); late traffic drops.
     done: bool,
 }
 
 #[derive(Default)]
 struct PartState {
-    /// "text" | "reasoning" | "tool" (unknown kinds are never registered).
     kind: String,
-    /// Bytes of part text already emitted (snapshots resend the full text;
-    /// deltas append).
     emitted: usize,
     tool_started: bool,
     tool_done: bool,
 }
 
 struct OcState {
-    /// The parent ACP session — a nested spawn's `session.created` (child of
-    /// a child) must not bind to this feed's chips.
     session_id: String,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     pending: VecDeque<PendingSpawn>,
-    /// child session id → streaming state.
     children: HashMap<String, ChildState>,
     unbound: HashMap<String, UnboundChild>,
-    /// Tracker dropped: the bus task exits and late completions settle
-    /// nothing further.
     torn_down: bool,
 }
 
@@ -117,8 +70,6 @@ pub(crate) struct OpencodeTracker {
 }
 
 impl OpencodeTracker {
-    /// `sidecar_base` is the process's HTTP root (`http://127.0.0.1:{port}`);
-    /// `None` (the port pick failed) degrades to chip + final output.
     pub(crate) fn new(
         session_id: String,
         event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -138,7 +89,6 @@ impl OpencodeTracker {
         Self { state }
     }
 
-    /// Inspect one `session/update` payload's `update` object (ACP side).
     pub(crate) fn observe(&mut self, update: &Value) {
         if !matches!(
             update.get("sessionUpdate").and_then(Value::as_str),
@@ -154,11 +104,6 @@ impl OpencodeTracker {
             return;
         }
         let mut state = self.state.lock().expect("tracker lock");
-        // A task spawn is identified by its rawInput shape — the tool name is
-        // only ever a display title on this wire. The first `pending` frame
-        // carries an empty rawInput and is skipped; the in_progress update
-        // (full rawInput) lands before the tool runs, so the chip is always
-        // registered ahead of the child's `session.created`.
         if let Some(raw) = update.get("rawInput")
             && raw.get("subagent_type").is_some()
             && raw.get("prompt").is_some()
@@ -174,7 +119,6 @@ impl OpencodeTracker {
                     tool_call_id: id.to_owned(),
                     description: description.to_owned(),
                 });
-                // A child that raced ahead of its chip binds now.
                 if let Some(child_id) = match_unbound(&state.unbound, description) {
                     state.unbound.remove(&child_id);
                     bind(&mut state, &child_id);
@@ -187,11 +131,6 @@ impl OpencodeTracker {
         }
     }
 
-    /// A task chip completed on the ACP wire: bind by the completion's
-    /// authoritative child session id, then settle the chip with a tagged
-    /// Done — after a short drain when the bus streamed (its last frames ride
-    /// an independent channel), immediately with the `<task_result>` fallback
-    /// text when it never did.
     fn settle_from_completion(
         &self,
         state: &mut OcState,
@@ -216,8 +155,6 @@ impl OpencodeTracker {
                 entry.parent_tool_use_id = tool_call_id.to_owned();
                 id
             }
-            // No id on the completion (older wire?): settle whichever bound
-            // child streams to this chip, else a synthetic record.
             None => state
                 .children
                 .iter()
@@ -262,10 +199,6 @@ impl OpencodeTracker {
 }
 
 impl Drop for OpencodeTracker {
-    /// Session teardown with subagents still streaming: settle every open
-    /// chip as interrupted rather than leaving it spinning forever. The
-    /// sends ride spawned tasks (whose `event_tx` clones keep the run's
-    /// event stream open until they land, grok-tail parity).
     fn drop(&mut self) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -291,9 +224,6 @@ impl Drop for OpencodeTracker {
     }
 }
 
-/// The completion's child session id: first-class
-/// `rawOutput.metadata.sessionId`, else parsed from the output's
-/// `<task id="...">` wrapper.
 fn completion_child_session(update: &Value) -> Option<String> {
     let metadata = update.get("rawOutput").and_then(|r| r.get("metadata"));
     if let Some(id) = metadata
@@ -309,8 +239,6 @@ fn completion_child_session(update: &Value) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
-/// The completion's raw output text (`rawOutput.output`, else the content
-/// blocks).
 fn completion_output(update: &Value) -> Option<String> {
     if let Some(text) = update
         .get("rawOutput")
@@ -333,8 +261,6 @@ fn completion_output(update: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-/// The `<task_result>` body of a completion's output — the whole text when
-/// the wrapper is missing (fail soft on a vendor-private shape).
 fn completion_result_text(update: &Value) -> Option<String> {
     let text = completion_output(update)?;
     let body = text
@@ -346,8 +272,6 @@ fn completion_result_text(update: &Value) -> Option<String> {
     (!body.is_empty()).then(|| cap_text(body, OUTPUT_CAP))
 }
 
-/// The unbound child whose title matches a pending description, else the
-/// only one (FIFO would need arrival order; one entry is the common case).
 fn match_unbound(unbound: &HashMap<String, UnboundChild>, description: &str) -> Option<String> {
     if !description.is_empty()
         && let Some(id) = unbound
@@ -362,9 +286,6 @@ fn match_unbound(unbound: &HashMap<String, UnboundChild>, description: &str) -> 
         .flatten()
 }
 
-/// Bind a stashed/incoming child to a pending chip: description match
-/// against the child title (`"{description} (@{agent} subagent)"`, FIFO
-/// across identical descriptions), else the oldest pending spawn.
 fn bind_to_pending(state: &mut OcState, child_id: &str, title: &str) -> bool {
     let ix = state
         .pending
@@ -390,7 +311,6 @@ fn bind_to_pending(state: &mut OcState, child_id: &str, title: &str) -> bool {
     }
 }
 
-/// Bind a previously-stashed unbound child (title already consumed).
 fn bind(state: &mut OcState, child_id: &str) {
     if let Some(p) = state.pending.pop_front() {
         state.children.insert(
@@ -403,14 +323,6 @@ fn bind(state: &mut OcState, child_id: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bus (SSE) side
-// ---------------------------------------------------------------------------
-
-/// Tail the sidecar's `/event` SSE bus into tagged events. Retries the first
-/// connect (the server binds a few seconds into the process's life); an
-/// established stream ending means the process is exiting — no reconnect,
-/// the ACP completion fallback still settles every chip.
 async fn bus_task(state: Arc<Mutex<OcState>>, base: String) {
     let Ok(client) = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -448,7 +360,6 @@ async fn stream_events(state: &Arc<Mutex<OcState>>, resp: reqwest::Response) {
             return;
         };
         buf.extend_from_slice(&bytes);
-        // SSE frames are blank-line separated; each data line is one event.
         while let Some(pos) = find_frame_end(&buf) {
             let frame: Vec<u8> = buf.drain(..pos + 2).collect();
             let Ok(frame) = std::str::from_utf8(&frame) else {
@@ -497,15 +408,11 @@ fn closed(state: &Arc<Mutex<OcState>>) -> bool {
         .unwrap_or(true)
 }
 
-/// Map one bus event to tagged transcript events (pure bookkeeping +
-/// mapping; the caller sends outside the lock).
 fn handle_bus_event(state: &mut OcState, event: &Value) -> Vec<AgentEvent> {
     let props = event.get("properties").unwrap_or(&Value::Null);
     match event.get("type").and_then(Value::as_str) {
         Some("session.created") => {
             let info = props.get("info").unwrap_or(&Value::Null);
-            // A nested spawn (a subagent's own subagent) carries the CHILD's
-            // session as parentID — never bind it to this feed's chips.
             if info.get("parentID").and_then(Value::as_str) != Some(state.session_id.as_str()) {
                 return Vec::new();
             }
@@ -588,9 +495,6 @@ fn handle_bus_event(state: &mut OcState, event: &Value) -> Vec<AgentEvent> {
     }
 }
 
-/// A part snapshot: emit whatever text extends what already streamed, open /
-/// resolve tool chips. Snapshots and deltas interleave — `emitted` (bytes of
-/// part text already sent) is the dedup line between them.
 fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent> {
     if child.done {
         return Vec::new();
@@ -605,11 +509,6 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
     let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
     match kind {
         "text" | "reasoning" => {
-            // A user-role text part is the message INTO the child — its
-            // spawn prompt (and any future steer). opencode's own UI renders
-            // these, so we do too: one UserMessage per part (posted
-            // atomically — there is no user delta channel), which the engine
-            // writes as its own user entry.
             if kind == "text" && child.assistant_messages.get(message_id) == Some(&false) {
                 let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                 if text.trim().is_empty() {
@@ -647,8 +546,6 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
             else {
-                // Shorter (or mid-char) snapshot: a rewrite this tracker
-                // doesn't model — drop it rather than duplicate text.
                 return Vec::new();
             };
             entry.emitted = text.len();
@@ -714,14 +611,10 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
             }
             events
         }
-        // step-start / step-finish / snapshot bookkeeping: not transcript.
         _ => Vec::new(),
     }
 }
 
-/// A text delta appends to its part. Deltas follow the part's opening
-/// `message.part.updated` (which fixes the kind); an unknown part defaults
-/// to assistant text only when its message is known assistant.
 fn part_delta_events(
     child: &mut ChildState,
     props: &Value,
@@ -761,7 +654,6 @@ fn part_delta_events(
     }]
 }
 
-/// Type an opencode-native tool invocation (bus names, not ACP kinds).
 fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
     let s = |keys: &[&str]| {
         keys.iter()
@@ -820,8 +712,6 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
                 })
                 .collect(),
         },
-        // A nested spawn inside the subagent: same naming as the parent chip
-        // (no recursive viz — it renders as a plain chip in the child doc).
         "task" => ToolCall::Unknown {
             name: s(&["description"])
                 .map(|d| format!("Agent: {d}"))
@@ -882,7 +772,6 @@ mod tests {
             Some("ses_child")
         );
         assert_eq!(completion_result_text(&update).as_deref(), Some("finished"));
-        // metadata absent → the <task id> wrapper still yields the id.
         let update = task_update(
             "t1",
             "completed",
@@ -926,7 +815,6 @@ mod tests {
         tracker.observe(&task_update("t1", "in_progress", None));
         {
             let mut state = tracker.state.lock().unwrap();
-            // Real 1.18.18 bus shapes.
             let created = json!({"type": "session.created", "properties": {"info": {
                 "id": "ses_child", "parentID": "ses_parent",
                 "title": "Viz probe (@general subagent)", "agent": "general",
@@ -942,9 +830,6 @@ mod tests {
                 "id": "prt_u", "messageID": "msg_u", "sessionID": "ses_child",
                 "type": "text", "text": "run the probe",
             }}});
-            // The message INTO the child (its prompt / a steer) forwards as
-            // a UserMessage — once: a re-delivered snapshot must not double
-            // the entry.
             assert!(matches!(
                 handle_bus_event(&mut state, &user_part).as_slice(),
                 [AgentEvent::Subagent { event, .. }]
@@ -969,7 +854,6 @@ mod tests {
                         && matches!(&**event, AgentEvent::ToolCall { id, call: ToolCall::Exec { command } }
                             if id == "call-1" && command == "echo ok")
             ));
-            // Repeated running snapshots don't re-open the chip.
             assert!(handle_bus_event(&mut state, &tool_running).is_empty());
             let tool_done = json!({"type": "message.part.updated", "properties": {"part": {
                 "id": "prt_t", "messageID": "msg_a", "sessionID": "ses_child",
@@ -984,7 +868,6 @@ mod tests {
                         if id == "call-1" && o == "ok\n")
             ));
 
-            // Snapshot + delta interleave dedups by emitted length.
             let text_open = json!({"type": "message.part.updated", "properties": {"part": {
                 "id": "prt_x", "messageID": "msg_a", "sessionID": "ses_child",
                 "type": "text", "text": "",
@@ -1006,8 +889,6 @@ mod tests {
             }}});
             assert!(handle_bus_event(&mut state, &settled).is_empty());
         }
-        // The ACP completion settles the chip: drain, then tagged Done (no
-        // fallback text — the transcript already streamed).
         tracker.observe(&task_update(
             "t1",
             "completed",

@@ -1,11 +1,5 @@
-//! Workspace lifecycle types shared by the engine and its clients.
-
 use serde::{Deserialize, Serialize};
 
-/// The fixed data boundary selected when an engine runtime is assembled.
-///
-/// Authentication can change while a runtime is alive, but its workspace scope
-/// cannot. Switching scopes requires assembling a new runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkspaceScope {
@@ -14,7 +8,6 @@ pub enum WorkspaceScope {
     Development,
 }
 
-/// Stable information about the engine runtime reached by a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInfo {

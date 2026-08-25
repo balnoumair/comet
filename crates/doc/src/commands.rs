@@ -1,13 +1,3 @@
-//! Durable command ledger — port of `packages/session-doc/src/commands.ts`.
-//!
-//! Rules (verbatim from zeron's design):
-//! 1. Each device inserts only its own entries; entries are append-only and immutable.
-//! 2. The chat's HOST is the sole writer of command outcomes; a composer may only set
-//!    `cancelled` on its own still-pending entries.
-//! 3. Evaluation (`evaluate_command`, pure): processed-id dedupe → Skip; expired TTL → Expired;
-//!    a newer command of the same kind supersedes steer/interrupt; an interrupt whose
-//!    `based_on.turn_id` is already past → Superseded; otherwise Execute.
-
 use serde::{Deserialize, Serialize};
 
 use zeron_proto::{RunRequest, UserInputAnswer};
@@ -40,7 +30,6 @@ pub enum SessionCommandPayload {
     #[serde(rename_all = "camelCase")]
     Run {
         request: RunRequest,
-        /// Client-minted message id for the optimistic user entry (dedup key).
         message_id: String,
     },
     #[serde(rename_all = "camelCase")]
@@ -80,11 +69,9 @@ pub struct SessionCommandEntry {
     pub id: String,
     pub payload: SessionCommandPayload,
     pub issued_by: String,
-    /// Epoch millis.
     pub issued_at: i64,
     #[serde(default)]
     pub based_on: Option<CommandBasedOn>,
-    /// Epoch millis; defaults to issued_at + COMMAND_DEFAULT_TTL_MS when absent.
     #[serde(default)]
     pub expires_at: Option<i64>,
     pub status: SessionCommandStatus,
@@ -103,38 +90,26 @@ impl SessionCommandEntry {
     }
 }
 
-/// Rule 2: only the composer that issued a still-pending command may cancel it.
 pub fn can_composer_cancel(entry: &SessionCommandEntry, device_id: &str) -> bool {
     entry.status == SessionCommandStatus::Pending && entry.issued_by == device_id
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandDisposition {
-    /// Already in the processed ledger — do nothing (idempotence).
     Skip,
-    /// Mark expired.
     Expired,
-    /// Mark superseded.
     Superseded,
-    /// Mark processed BEFORE executing, then execute.
     Execute,
 }
 
-/// Context the host evaluates a pending command against.
 pub struct EvaluationContext<'a> {
-    /// Processed-command ledger membership test.
     pub is_processed: &'a dyn Fn(&str) -> bool,
-    /// Current wall clock, epoch millis.
     pub now_ms: i64,
-    /// All command entries in doc order (used to find newer same-kind entries).
     pub entries: &'a [SessionCommandEntry],
-    /// The id of the turn currently (or most recently) running, if any.
     pub current_turn_id: Option<&'a str>,
-    /// True when the given turn id has already completed.
     pub turn_is_past: &'a dyn Fn(&str) -> bool,
 }
 
-/// Rule 3 — pure evaluation of a single pending command.
 pub fn evaluate_command(
     entry: &SessionCommandEntry,
     cx: &EvaluationContext<'_>,
@@ -145,7 +120,6 @@ pub fn evaluate_command(
     if cx.now_ms >= entry.effective_expiry() {
         return CommandDisposition::Expired;
     }
-    // A newer pending command of the same kind supersedes steer/interrupt.
     let kind = entry.kind();
     if matches!(
         kind,
@@ -161,7 +135,6 @@ pub fn evaluate_command(
             return CommandDisposition::Superseded;
         }
     }
-    // An interrupt aimed at a turn that already finished is moot.
     if kind == SessionCommandKind::Interrupt
         && let Some(based_on) = &entry.based_on
         && let Some(turn_id) = &based_on.turn_id
@@ -261,14 +234,12 @@ mod tests {
         let past = |id: &str| id == "turn-1";
         let cx1 = cx(&entries, &NEVER, &past, 2_000, Some("turn-2"));
         assert_eq!(evaluate_command(&e, &cx1), CommandDisposition::Superseded);
-        // …but if that turn is still the current one, execute.
         let cx2 = cx(&entries, &NEVER, &past, 2_000, Some("turn-1"));
         assert_eq!(evaluate_command(&e, &cx2), CommandDisposition::Execute);
     }
 
     #[test]
     fn runs_are_not_superseded_by_newer_runs() {
-        // Two queued runs both execute (in order); supersession applies to steer/interrupt only.
         let r1 = entry(
             "r1",
             SessionCommandPayload::Run {

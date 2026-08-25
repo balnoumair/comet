@@ -1,9 +1,3 @@
-//! End-to-end: a CLI visible only through the login shell's PATH resolves.
-//!
-//! This file must stay a single test: it mutates process env (SHELL/PATH/HOME)
-//! and warms the process-global login-shell snapshot cache, so it needs its
-//! own test binary with no parallel siblings.
-
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -25,7 +19,6 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     write_executable(&shell_bin.join("pi-acp"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("claude"), "#!/bin/sh\nexit 0\n");
 
-    // A $SHELL whose init shapes PATH — the shape resolution must survive.
     let fake_shell = dir.path().join("fake-shell");
     write_executable(
         &fake_shell,
@@ -39,9 +32,6 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         ),
     );
 
-    // A GUI/service-launch environment: minimal PATH, no CLIs reachable, HOME
-    // pointed away from any real install dirs.
-    // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
         std::env::set_var("SHELL", &fake_shell);
         std::env::set_var("HOME", dir.path());
@@ -59,10 +49,6 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         "snapshot should carry the shell-shaped PATH, got: {snapshot}"
     );
 
-    // The agent binaries are only reachable through the snapshot; the
-    // launch program (not the npx fallback) must be the shell-PATH binary,
-    // proving resolution consulted the login-shell snapshot.
-    // Native drivers consult the same snapshot for the agent CLI itself.
     assert!(
         zeron_harness::ClaudeHarness::new().installed(),
         "claude resolves via login-shell PATH"

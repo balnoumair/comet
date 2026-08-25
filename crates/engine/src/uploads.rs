@@ -1,18 +1,3 @@
-//! Uploads — local attachment staging for chat prompts and transcripts.
-//!
-//! A host streams a file as base64 chunks (~60KB); chunks stage on disk under
-//! `{uploads_root}/tmp/{uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike
-//! in-memory buffers), and `commit` assembles them into
-//! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
-//! composer appends to the prompt so the agent can read the file from disk.
-//! Attachments live only in the local uploads root and are read through
-//! `ReadAttachmentChunk`.
-//!
-//! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
-//! only files under the uploads dir or a workspace-known chat cwd are readable
-//! (the RPC layer supplies the cwd roots) — and only supported image types, as
-//! in zeron.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,33 +8,23 @@ use serde::Serialize;
 
 use crate::EngineError;
 
-/// A pending upload must finish within this window (covers slow mesh links).
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Hard cap on an assembled file.
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
-/// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
 
-/// `ReadAttachmentChunk` reply.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentChunk {
     pub name: String,
     pub mime_type: String,
-    /// Base64 of this chunk's byte range.
     pub data: String,
     pub next_offset: u64,
     pub done: bool,
 }
 
 struct UploadsInner {
-    /// Profile-scoped durable home for new committed attachments.
     dir: PathBuf,
-    /// Chunk staging (`{uploads_root}/tmp/{uploadId}/`).
     tmp: PathBuf,
-    /// Historical roots accepted for reads only. Writes and staging never use
-    /// them. RwLock: a local-profile import adds its source root at runtime so
-    /// imported transcripts resolve without an engine restart.
     read_only_roots: std::sync::RwLock<Vec<PathBuf>>,
 }
 
@@ -59,17 +34,14 @@ pub struct Uploads {
 }
 
 impl Uploads {
-    /// Use the historical device-global uploads directory.
     pub fn new(data_dir: &Path) -> Self {
         Self::from_root(&data_dir.join("uploads"))
     }
 
-    /// Use an already-resolved profile uploads directory.
     pub fn from_root(dir: &Path) -> Self {
         Self::from_root_with_fallback(dir, None)
     }
 
-    /// Use a profile root for all writes and an optional legacy read-only root.
     pub fn from_root_with_fallback(dir: &Path, legacy_read_root: Option<&Path>) -> Self {
         Self {
             inner: Arc::new(UploadsInner {
@@ -85,14 +57,10 @@ impl Uploads {
         }
     }
 
-    /// The durable uploads dir (a path-jail root).
     pub fn dir(&self) -> &Path {
         &self.inner.dir
     }
 
-    /// Accept `root` for reads from now on (idempotent). Profile import calls
-    /// this so transcripts that embed absolute paths under the local profile's
-    /// uploads root keep resolving after a process restart.
     pub fn add_read_only_root(&self, root: &Path) {
         let mut roots = self
             .inner
@@ -104,9 +72,6 @@ impl Uploads {
         }
     }
 
-    /// Stage one base64 chunk. Positional (`seq`) writes are IDEMPOTENT: a client
-    /// retrying a chunk whose ack was lost overwrites the same slot instead of
-    /// double-appending. Callers without `seq` get append-only behavior.
     pub fn append(&self, upload_id: &str, data: &str, seq: Option<u64>) -> Result<(), EngineError> {
         let dir = self.staging_dir(upload_id)?;
         self.sweep();
@@ -118,7 +83,6 @@ impl Uploads {
         if at > 1_000_000 {
             return Err(EngineError::Other("Invalid chunk index".into()));
         }
-        // Base64 inflates by ~4/3; bound the staged payload against the file cap.
         let staged: u64 = chunk_files(&dir)?
             .iter()
             .filter(|(seq, _)| *seq != at)
@@ -132,8 +96,6 @@ impl Uploads {
         Ok(())
     }
 
-    /// Assemble the staged chunks into a durable file and return its absolute
-    /// path.
     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
@@ -141,8 +103,6 @@ impl Uploads {
             return Err(EngineError::Other("Unknown or expired upload".into()));
         }
         parts.sort_by_key(|(seq, _)| *seq);
-        // Positional appends may leave holes if a chunk never arrived — joining
-        // around them would silently corrupt the file.
         let mut joined = String::new();
         for (i, (seq, path)) in parts.iter().enumerate() {
             if *seq != i as u64 {
@@ -166,8 +126,6 @@ impl Uploads {
         Ok(path.to_string_lossy().to_string())
     }
 
-    /// Read one 45KB chunk of an attachment. `extra_roots` are the workspace's
-    /// known chat cwds — together with the uploads dir they form the path jail.
     pub fn read_chunk(
         &self,
         path: &str,
@@ -179,7 +137,6 @@ impl Uploads {
         let size = file.size;
         let start = offset.min(size);
         let next_offset = (start + READ_CHUNK_BYTES).min(size);
-        // Read ONLY this chunk's byte range — never the whole file per chunk.
         let mut buf = vec![0u8; (next_offset - start) as usize];
         let mut handle = std::fs::File::open(&file.resolved)?;
         handle.seek(std::io::SeekFrom::Start(start))?;
@@ -201,10 +158,7 @@ impl Uploads {
         })
     }
 
-    // ── internals ───────────────────────────────────────────────────────────
-
     fn staging_dir(&self, upload_id: &str) -> Result<PathBuf, EngineError> {
-        // The id becomes a directory name — jail it to a safe charset.
         let ok = !upload_id.is_empty()
             && upload_id.len() <= 64
             && upload_id
@@ -216,8 +170,6 @@ impl Uploads {
         Ok(self.inner.tmp.join(upload_id))
     }
 
-    /// Reclaim staging dirs whose newest chunk is older than the TTL (an upload
-    /// abandoned mid-stream must not hold up to 32MB forever).
     fn sweep(&self) {
         let Ok(entries) = std::fs::read_dir(&self.inner.tmp) else {
             return;
@@ -232,7 +184,7 @@ impl Uploads {
                 .max();
             let expired = match newest {
                 Some(at) => at.elapsed().map(|age| age > STAGING_TTL).unwrap_or(false),
-                None => true, // empty dir — reclaim
+                None => true,
             };
             if expired {
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -242,7 +194,6 @@ impl Uploads {
 
     fn inspect(&self, path: &str, extra_roots: &[PathBuf]) -> Result<InspectedFile, EngineError> {
         let outside = || EngineError::Other("Attachment is outside the upload cache".into());
-        // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
         let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
         let read_roots = self
             .inner

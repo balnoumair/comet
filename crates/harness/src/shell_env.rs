@@ -1,35 +1,8 @@
-//! Login-shell PATH snapshot.
-//!
-//! GUI/service launches (Dock, Finder, launchd, systemd) never run the user's
-//! shell init, so the daemon's own PATH misses everything the shell shapes:
-//! nvm's shell function, fnm multishells, asdf/mise shims, custom npm
-//! prefixes, nix profiles, `~/.zshrc` exports. The hardcoded known-location
-//! lists in the resolvers cover the common managers, but the only fix that
-//! works for *any* setup is asking the user's actual shell: spawn it once as
-//! an interactive login shell, have it print its environment between markers,
-//! and keep the PATH it reports. If `codex`/`claude` runs in their terminal,
-//! it resolves here too.
-//!
-//! The snapshot is captured once per process (cached, including a negative
-//! result) and is defensive about hostile shell init:
-//! - `-lic` first (interactive login — nvm and friends load in rc files),
-//!   falling back to `-lc` if that produces nothing (some rc files hang or
-//!   `exec` a multiplexer when interactive).
-//! - Output is read on a side thread into a shared buffer; the poll loop
-//!   returns as soon as the end marker appears, so init that blocks *after*
-//!   printing (or grandchildren inheriting the pipe) can't wedge us.
-//! - A hard per-attempt timeout kills the shell.
-//!
-//! Set `ZERON_NO_LOGIN_SHELL=1` to disable the snapshot entirely.
-
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
 static CACHE: OnceLock<Option<OsString>> = OnceLock::new();
 
-/// The PATH the user's login shell reports, captured once and cached for the
-/// life of the process. `None` when disabled, non-unix, no usable shell, or
-/// the shell never produced a parseable snapshot.
 pub fn login_shell_path() -> Option<&'static OsStr> {
     #[cfg(unix)]
     {
@@ -41,8 +14,6 @@ pub fn login_shell_path() -> Option<&'static OsStr> {
     }
 }
 
-/// Kick off the snapshot on a background thread so the first harness resolve
-/// doesn't pay the shell-startup latency inline. Call at daemon startup.
 pub fn prewarm() {
     #[cfg(unix)]
     {
@@ -66,10 +37,8 @@ mod unix {
 
     const BEGIN_MARKER: &str = "__ZERON_SHELL_ENV_BEGIN__";
     const END_MARKER: &str = "__ZERON_SHELL_ENV_END__";
-    /// Enough for any sane environment; a runaway rc file can't OOM us.
     const MAX_OUTPUT: usize = 2 * 1024 * 1024;
     const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-    /// After the shell exits, wait this long for the pipe to flush.
     const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
     pub(super) fn capture() -> Option<OsString> {
@@ -80,14 +49,11 @@ mod unix {
         snapshot_path(&shell, ATTEMPT_TIMEOUT)
     }
 
-    /// The user's shell: `$SHELL`, then the passwd entry, then well-known
-    /// defaults. Non-executables and nologin shells are skipped.
     fn user_shell() -> Option<PathBuf> {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(s) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) {
             candidates.push(PathBuf::from(s));
         }
-        // systemd/launchd services often start without SHELL — passwd has it.
         if let Some(p) = passwd_shell() {
             candidates.push(p);
         }
@@ -102,8 +68,6 @@ mod unix {
     }
 
     fn passwd_shell() -> Option<PathBuf> {
-        // SAFETY: getpwuid's static buffer is only read here, and callers are
-        // serialized through the OnceLock init above.
         unsafe {
             let pw = libc::getpwuid(libc::getuid());
             if pw.is_null() || (*pw).pw_shell.is_null() {
@@ -120,9 +84,6 @@ mod unix {
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
 
-    /// Flag sets to try, most-loaded first. csh/tcsh reject `-l` combined with
-    /// `-c`; fish runs config.fish for every invocation, so `-l` alone loads
-    /// everything without interactive-mode side effects.
     fn attempt_flag_sets(shell: &Path) -> Vec<Vec<&'static str>> {
         let name = shell
             .file_name()
@@ -135,8 +96,6 @@ mod unix {
         }
     }
 
-    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until one
-    /// yields a parseable PATH.
     pub(super) fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
         let script = format!("echo {BEGIN_MARKER}; env; echo {END_MARKER}");
         for flags in attempt_flag_sets(shell) {
@@ -148,11 +107,6 @@ mod unix {
         None
     }
 
-    /// Spawn the shell and collect stdout until the end marker appears, the
-    /// child exits (plus a flush grace), or the timeout kills it. The reader
-    /// lives on its own thread appending into a shared buffer, so a shell that
-    /// blocks after printing — or a grandchild that inherits the pipe and
-    /// never closes it — can't hang us on EOF.
     fn run_and_capture(shell: &Path, flags: &[&str], script: &str, timeout: Duration) -> Vec<u8> {
         let mut cmd = std::process::Command::new(shell);
         cmd.args(flags)
@@ -160,8 +114,6 @@ mod unix {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            // Let rc files detect (and skip work for) this probe, mirroring
-            // VSCODE_RESOLVING_ENVIRONMENT; TERM=dumb quiets fancy prompts.
             .env("ZERON_RESOLVING_ENVIRONMENT", "1")
             .env("TERM", "dumb");
         let Ok(mut child) = cmd.spawn() else {
@@ -198,7 +150,6 @@ mod unix {
                 let b = buf
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Only scan the unscanned tail (minus marker-length overlap).
                 let from = scanned.saturating_sub(END_MARKER.len());
                 if find_subslice(&b[from..], END_MARKER.as_bytes()).is_some() {
                     break;
@@ -231,9 +182,6 @@ mod unix {
         b.clone()
     }
 
-    /// Extract PATH from the `env` dump between the LAST begin marker and the
-    /// first end marker after it (rc noise printed before our command — or a
-    /// marker echoed by init itself — lands before the real one).
     fn parse_snapshot_path(output: &[u8]) -> Option<OsString> {
         let begin = rfind_subslice(output, BEGIN_MARKER.as_bytes())?;
         let after = &output[begin + BEGIN_MARKER.len()..];
@@ -273,7 +221,6 @@ mod unix {
             path
         }
 
-        /// A fake $SHELL skeleton: consume flags, exec the `-c` payload.
         const RUN_PAYLOAD: &str = r#"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-c" ]; then shift; exec /bin/sh -c "$1"; fi
@@ -293,8 +240,6 @@ exit 1
 
         #[test]
         fn ignores_marker_echoed_by_init() {
-            // rc noise that happens to contain the begin marker but no PATH
-            // after it must not shadow the real snapshot.
             let output =
                 format!("{BEGIN_MARKER}\ngarbage\n{BEGIN_MARKER}\nPATH=/real/bin\n{END_MARKER}\n");
             let path = parse_snapshot_path(output.as_bytes()).unwrap();
@@ -318,8 +263,6 @@ exit 1
         #[test]
         fn falls_back_when_interactive_attempt_hangs() {
             let dir = tempfile::tempdir().unwrap();
-            // Simulates rc files that wedge only in interactive mode (`exec
-            // tmux` and friends): sleep forever when -i is present.
             let shell = fake_shell(
                 dir.path(),
                 &format!(
@@ -334,8 +277,6 @@ exit 1
                 "got: {}",
                 path.to_string_lossy()
             );
-            // First attempt burned ~400ms then was killed; the whole resolve
-            // must not have waited out the sleep.
             assert!(start.elapsed() < Duration::from_secs(5));
         }
 

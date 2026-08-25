@@ -1,6 +1,3 @@
-//! CodexHarness integration tests against the fake app server in
-//! `tests/fixtures/fake-codex.sh` (no real `codex` binary involved).
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +45,6 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
-/// Controls whose `request_input` answers every question with `answer_label`.
 fn controls(
     answer_label: &'static str,
 ) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
@@ -98,7 +94,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
     let events = run_to_end(&harness(), req, controls).await;
 
-    // SessionStarted from thread/start's thread id.
     let starts: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -119,7 +114,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     assert_eq!(cwd, "/tmp");
     assert_eq!(session_id, "th-1");
 
-    // Deltas — both wire spellings accepted.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "Hello".into()
     }));
@@ -130,7 +124,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         text: "summary".into()
     }));
 
-    // commandExecution: ToolCall at started only, exit code 1 => error result.
     assert_eq!(
         events
             .iter()
@@ -151,7 +144,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
-    // fileChange (single add): WriteFile, refreshed at completion.
     assert_eq!(
         events
             .iter()
@@ -173,7 +165,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
-    // mcpToolCall with failed status.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "mcp1".into(),
         call: ToolCall::Mcp {
@@ -189,7 +180,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
-    // webSearch lifecycle.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "w1".into(),
         call: ToolCall::WebSearch {
@@ -203,7 +193,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
-    // Completion-only todoList still opens and closes the lifecycle.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "td1".into(),
         call: ToolCall::Todo {
@@ -226,14 +215,12 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
-    // Streamed agentMessage must not re-emit its completed text…
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Hello world")),
         "streamed message text re-emitted: {events:?}"
     );
-    // …but a never-streamed one falls back to the completed text.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "unstreamed tail".into()
     }));
@@ -245,7 +232,6 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         2
     );
 
-    // Usage rides just before the terminal Done.
     let usage_pos = events
         .iter()
         .position(|e| {
@@ -302,7 +288,6 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
 
-    // The fake only emits this delta after verifying expectedTurnId + text.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "steered".into()
     }));
@@ -329,7 +314,6 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer-race"), controls).await;
 
-    // Two turns: the raced one completes, then the fallback carries the steer.
     let dones: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -354,7 +338,6 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
         first_done_pos < steered_pos,
         "fallback turn starts after the raced turn ends: {events:?}"
     );
-    // Only emitted by the fake when the fallback turn/start carried the text.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "fallback".into()
     }));
@@ -362,11 +345,6 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
 
 #[tokio::test]
 async fn approvals_round_trip_as_input_requests() {
-    // Approvals must reach the ENGINE's input bridge (`request_input`) — and
-    // the harness must NOT emit its own `InputRequested`/`InputResolved`
-    // twins: the bridge owns that lifecycle (it mints the request id the
-    // resolver is parked under; a harness-emitted copy folded an unanswerable
-    // duplicate chip into the doc).
     let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
@@ -408,7 +386,6 @@ async fn approvals_round_trip_as_input_requests() {
         "harness must not emit input lifecycle events itself: {events:?}"
     );
 
-    // The fake only completes the turn after seeing BOTH accept decisions.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -427,7 +404,6 @@ async fn approval_no_answer_becomes_decline() {
     req.auto_approve = false;
     let events = run_to_end(&harness(), req, controls).await;
 
-    // The fake only completes the turn after seeing the decline decision.
     assert!(
         matches!(
             events.last(),
@@ -453,7 +429,7 @@ async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
         while let Some(ev) = stream.next().await {
             let ev = ev.expect("stream event");
             if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
-                token.cancel(); // interrupt mid-turn
+                token.cancel();
             }
             events.push(ev);
         }
@@ -590,12 +566,7 @@ async fn models_returns_curated_catalog() {
     );
 
     let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
-    // models() requires a resolvable binary… but with_executable trusts the
-    // caller's path, so only the default resolution can report NotInstalled —
-    // exercise the harness identity surface instead.
     assert_eq!(missing.id(), HarnessId::Codex);
-    // "Codex" — comet composer/defaults.ts HARNESS_LABEL (and the registry's
-    // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
 }
@@ -605,8 +576,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(&harness(), request("scenario:subagent"), controls).await;
 
-    // Exactly one Done — the child's turn/completed must NOT settle the
-    // parent turn (the swallowed-catch-all bug class this table exists for).
     let dones: Vec<usize> = events
         .iter()
         .enumerate()
@@ -614,15 +583,12 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
         .collect();
     assert_eq!(dones.len(), 1, "one parent Done only: {events:?}");
 
-    // Parent output that follows the child's turn/completed still streams.
     let late_parent = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "parent still going"))
         .expect("parent delta after child turn end");
     assert!(late_parent < dones[0]);
 
-    // The spawn chip lives on the parent feed, named from the agent path,
-    // and resolves when the activity completes.
     assert!(events.iter().any(|e| matches!(
         e,
         AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
@@ -631,7 +597,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
     assert!(events.iter().any(
         |e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == "call_alpha")
     ));
-    // The root's own subAgentActivity produces no chip.
     assert!(
         !events
             .iter()
@@ -639,8 +604,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
         "root self-activity must not register or render: {events:?}"
     );
 
-    // Child deltas and items arrive tagged with the spawn call id — never
-    // bare (child threads stream deltas on this wire; live-verified 0.146.1).
     assert!(events.contains(&AgentEvent::Subagent {
         parent_tool_use_id: "call_alpha".into(),
         event: Box::new(AgentEvent::TextDelta {
@@ -665,9 +628,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
             diff: None,
         }),
     }));
-    // The parent's steer (a userMessage item on the CHILD thread) arrives as
-    // exactly one tagged UserMessage — completed only, never doubled by the
-    // started lifecycle event, never leaked untagged.
     assert_eq!(
         events
             .iter()
@@ -694,9 +654,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
         "child tool call leaked into the parent feed: {events:?}"
     );
 
-    // The child's turn/completed (and later thread/closed) become tagged
-    // terminal events — real fan-outs never call close_agent, so the turn
-    // end is what flips the chip off "running".
     assert!(
         events
             .iter()
@@ -710,8 +667,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
             >= 1,
         "{events:?}"
     );
-    // The tagged terminal must arrive from turn/completed — BEFORE the
-    // parent delta that follows it in the script (not only at thread/closed).
     let child_done = events
         .iter()
         .position(|e| {
@@ -730,9 +685,6 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
     assert!(child_done < late_parent_delta, "{events:?}");
 }
 
-/// Live smoke against the REAL codex app-server (0.146.x, installed + authed):
-/// one trivial turn, ending on turn/completed.
-/// `cargo test -p zeron-harness --test codex -- --ignored`.
 #[tokio::test]
 #[ignore = "spawns the real codex app-server; needs install + auth + network"]
 async fn live_real_app_server_single_turn() {
@@ -741,8 +693,6 @@ async fn live_real_app_server_single_turn() {
     req.cwd = std::env::temp_dir().display().to_string();
     let (controls, _steer, _token) = controls("Yes");
     let mut stream = harness.run(req, controls).await.expect("run starts");
-    // The session parks after the turn (steering mailbox open) — collect up
-    // to the first Done, not stream end.
     let events = tokio::time::timeout(Duration::from_secs(120), async {
         let mut events = Vec::new();
         while let Some(ev) = stream.next().await {

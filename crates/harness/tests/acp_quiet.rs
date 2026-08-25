@@ -1,9 +1,3 @@
-//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
-//! the GROK spec so no adapter-specific evidence (Claude's cost frame,
-//! `noRunningTurn` steering reasons) is in play — this is the path every ACP
-//! agent gets. Own test binary: the env knob is process-global, and every
-//! test here shares the one value.
-
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
@@ -21,8 +15,6 @@ const QUIET_MS: u64 = 1200;
 fn init_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // SAFETY: set before any harness runs in this test process; all
-        // tests in this binary share the one value.
         unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE_MS", QUIET_MS.to_string()) };
     });
 }
@@ -110,9 +102,6 @@ fn dones(events: &[(std::time::Instant, AgentEvent)]) -> Vec<(DoneStatus, Option
         .collect()
 }
 
-/// A generic agent whose prompt response is dropped: content streamed, no
-/// open tool, then silence. The blanket settle must produce a clean Done off
-/// the quiet window, well before the fixture's held-open stream ends.
 #[tokio::test]
 async fn generic_dropped_reply_settles_off_the_quiet_window() {
     init_env();
@@ -133,8 +122,6 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
         .find(|(_, e)| matches!(e, AgentEvent::Done { .. }))
         .map(|(t, _)| t.duration_since(started))
         .expect("done asserted above");
-    // Window is 1.2s; the fixture holds the stream open for 8s. The Done
-    // must come from the settle, not EOF (margin sized for suite load).
     assert!(
         done_at < Duration::from_secs(6),
         "Done at {done_at:?} — should ride the {QUIET_MS}ms quiet window, \
@@ -142,10 +129,6 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
     );
 }
 
-/// The guard: an OPEN tool call makes silence legitimate. The fixture is
-/// quiet for ~3x the settle window mid-tool-call, then finishes normally —
-/// exactly one Done, arriving from the real response, never a premature
-/// synthesized one.
 #[tokio::test]
 async fn open_tool_call_holds_the_quiet_settle_off() {
     init_env();
@@ -160,8 +143,6 @@ async fn open_tool_call_holds_the_quiet_settle_off() {
         vec![(DoneStatus::Completed, None)],
         "{events:?}"
     );
-    // The "finished" text (streamed after the quiet stretch) must precede
-    // the single Done — a premature settle would have flipped that order.
     let finished = events
         .iter()
         .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))

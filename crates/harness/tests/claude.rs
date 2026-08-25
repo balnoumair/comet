@@ -1,7 +1,3 @@
-//! ClaudeHarness integration tests against the fake CLI in
-//! `tests/fixtures/fake-claude.sh` (no real `claude` binary involved).
-//! A live smoke test against the real CLI lives at the bottom, `#[ignore]`d.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,7 +45,6 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
-/// Controls whose `request_input` answers every question with `answer_label`.
 fn controls(
     answer_label: &'static str,
 ) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
@@ -93,7 +88,6 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
     let (controls, _steer, _token) = controls("A");
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;
 
-    // One SessionStarted despite the re-emitted init frame.
     let starts: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -121,8 +115,6 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         text: "Hello".into()
     }));
 
-    // Subagent frames (parent_tool_use_id set) arrive TAGGED — never as bare
-    // parent-feed events.
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -162,7 +154,6 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         }),
     }));
 
-    // Typed tool decoding: Bash -> Exec, mcp__server__tool -> Mcp.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "tool-1".into(),
         call: ToolCall::Exec {
@@ -195,7 +186,6 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         diff: None,
     }));
 
-    // Informational rate-limit frames stay quiet.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
 
     assert!(events.contains(&AgentEvent::Usage {
@@ -215,9 +205,6 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
 
 #[tokio::test]
 async fn eager_done_forwards_wake_turn_as_second_done() {
-    // The background-subagent shape (live-verified 2.1.228): result #1 is
-    // eager — the run must NOT hold the turn for the subagent — and the wake
-    // turn's frames flow through the SAME stream, settling with result #2.
     let (controls, _steer, _token) = controls("A");
     let events = run_to_end(&harness(), request("scenario:wake"), controls).await;
 
@@ -232,7 +219,6 @@ async fn eager_done_forwards_wake_turn_as_second_done() {
         "eager done + wake done: {events:?}"
     );
 
-    // One SessionStarted total — the wake init is deduped.
     assert_eq!(
         events
             .iter()
@@ -241,7 +227,6 @@ async fn eager_done_forwards_wake_turn_as_second_done() {
         1
     );
 
-    // The subagent's interior streams tagged BETWEEN the two dones.
     let tagged_position = events
         .iter()
         .position(|e| {
@@ -253,14 +238,12 @@ async fn eager_done_forwards_wake_turn_as_second_done() {
         "subagent interior must stream between the eager done and the wake done: {events:?}"
     );
 
-    // The wake turn's own (untagged) output precedes the second done.
     let wake_text = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "subagent finished"))
         .expect("wake-turn delta present");
     assert!(done_positions[0] < wake_text && wake_text < done_positions[1]);
 
-    // Both dones settle Completed with the same session id.
     for i in done_positions {
         assert!(matches!(
             &events[i],
@@ -275,11 +258,6 @@ async fn eager_done_forwards_wake_turn_as_second_done() {
 
 #[tokio::test]
 async fn ask_user_question_round_trips_through_the_control_channel() {
-    // The questions must reach the ENGINE's input bridge (`request_input`) —
-    // and the harness must NOT emit its own `InputRequested`/`InputResolved`
-    // twins: the bridge owns that lifecycle (it mints the request id the
-    // resolver is parked under; a harness-emitted copy folded an unanswerable
-    // duplicate chip into the doc).
     let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
@@ -317,9 +295,6 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         "harness must not emit input lifecycle events itself: {events:?}"
     );
 
-    // "answered" proves both control round-trips: the plain Bash can_use_tool
-    // was auto-allowed AND the answers reached the CLI as updatedInput.answers
-    // keyed by question text.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -359,7 +334,6 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
 
-    // The fake CLI echoes the steer line's content back as a delta.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "steered:redirect please".into()
     }));
@@ -388,7 +362,7 @@ async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
         while let Some(ev) = stream.next().await {
             let ev = ev.expect("stream event");
             if matches!(ev, AgentEvent::SessionStarted { .. }) {
-                token.cancel(); // interrupt as soon as the session is up
+                token.cancel();
             }
             events.push(ev);
         }
@@ -431,7 +405,6 @@ async fn error_codes_map_to_readable_messages() {
         "rejected rate_limit_event not mapped: {errors:?}"
     );
 
-    // Empty `errors` array on the result falls back to subtype wording.
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -457,21 +430,12 @@ async fn missing_binary_is_not_installed() {
 
 #[tokio::test]
 async fn captured_live_background_subagent_frames_replay_correctly() {
-    // Frames captured VERBATIM from claude 2.1.228 (2026-08-17): a turn that
-    // spawns a background Agent subagent — eager result while it runs, tagged
-    // subagent traffic, then the wake turn (second init, same session id,
-    // second result). Replayed through the fake-CLI transport so the whole
-    // driver path (wire parse → normalize → run loop) is exercised, not just
-    // the normalizer.
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("claude")
         .join("live-2.1.228-background-subagent.jsonl");
     let script = std::fs::read_to_string(&fixture).expect("fixture readable");
-    // A one-off cat-style fake CLI: reads the prompt line, plays the capture.
-    // The capture contains one can_use_tool control_request; the driver
-    // auto-allows it on stdin, which this replayer ignores.
     let dir = std::env::temp_dir().join(format!("claude-replay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmp dir");
     let frames = dir.join("frames.jsonl");
@@ -495,7 +459,6 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
     let (controls, _steer, _token) = controls("A");
     let events = run_to_end(&harness, request("replay"), controls).await;
 
-    // One SessionStarted (the wake init dedupes), two Dones (eager + wake).
     assert_eq!(
         events
             .iter()
@@ -511,9 +474,6 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
         .collect();
     assert_eq!(dones.len(), 2, "eager done + wake done: {events:?}");
 
-    // The parent-feed Agent spawn is a plain tool call; the subagent's own
-    // Bash call arrives tagged with the spawning tool-use id, between the
-    // two dones, and never as a bare parent event.
     let spawn_id = events
         .iter()
         .find_map(|e| match e {
@@ -524,8 +484,6 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
             _ => None,
         })
         .expect("Agent spawn tool call in the parent feed");
-    // The synthesized opening user message rides WITH the spawn (before the
-    // eager done); the child's own interior streams between the two dones.
     let opening: Vec<usize> = events
         .iter()
         .enumerate()
@@ -571,9 +529,6 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Live smoke against the REAL claude CLI (2.1.x, must be installed + authed):
-/// one trivial turn through the stdio permission channel, ending on the
-/// result frame. `cargo test -p zeron-harness --test claude -- --ignored`.
 #[tokio::test]
 #[ignore = "spawns the real claude CLI; needs install + auth + network"]
 async fn live_real_cli_single_turn() {
@@ -581,11 +536,9 @@ async fn live_real_cli_single_turn() {
     let mut req = request("Reply with exactly the word: pong");
     req.model = Some("haiku".into());
     req.cwd = std::env::temp_dir().display().to_string();
-    req.auto_approve = false; // exercise --permission-prompt-tool stdio
+    req.auto_approve = false;
     let (controls, _steer, _token) = controls("A");
     let mut stream = harness.run(req, controls).await.expect("run starts");
-    // The session PARKS after the turn (steering mailbox still open, the CLI
-    // waits for more stdin) — collect up to the first Done, not stream end.
     let events = tokio::time::timeout(Duration::from_secs(120), async {
         let mut events = Vec::new();
         while let Some(ev) = stream.next().await {
