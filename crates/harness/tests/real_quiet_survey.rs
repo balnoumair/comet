@@ -1,16 +1,3 @@
-//! Production-settings survey across ALL harnesses: does a real multi-tool
-//! turn settle exactly once, at the end, and how close do its silent gaps
-//! come to the 30s blanket quiet-settle window? Run explicitly:
-//!
-//!   SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
-//!
-//! No env knob is set here — this binary runs the DEFAULTS the app ships:
-//! Claude exempt from the blanket settle, every other adapter on the 30s
-//! window. For each installed+authenticated agent CLI it reports, per run:
-//! the Done count, content events after the first Done (orphan signature),
-//! and the maximum inter-event silent gap — the safety margin against the
-//! window. Uninstalled/unauthenticated agents are skipped by name.
-
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -132,8 +119,6 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
     let first_done_idx = events
         .iter()
         .position(|(_, e)| matches!(e, AgentEvent::Done { .. }));
-    // Max silent gap while the turn is live: consecutive-event gaps from the
-    // first event through the first Done (post-Done observation excluded).
     let live_end = first_done_idx.unwrap_or(events.len().saturating_sub(1));
     let max_gap = events[..=live_end.min(events.len().saturating_sub(1))]
         .windows(2)

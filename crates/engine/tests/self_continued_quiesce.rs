@@ -1,14 +1,3 @@
-//! Parked-session completion boundaries (2026-08-13 incident: "stuck in
-//! working after you finished watching the build").
-//!
-//! A turn the agent starts on its own — a background-task wake — has no
-//! prompt-owned Done to settle it. Its late output must therefore stay parked
-//! rather than re-opening Working without an explicit new steer boundary.
-//!
-//! This file exists separately from `turn_quiesce.rs` because the env knob is
-//! process-global: here the NORMAL window is set far beyond the test horizon,
-//! so the explicit steer test can verify that a live turn remains Working.
-
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -25,16 +14,12 @@ use zeron_proto::{
 };
 
 const CHAT: &str = "chat-self-quiesce";
-/// Normal window: far beyond the test horizon — any park inside the test
-/// window is intentionally far beyond the test horizon.
 const QUIESCE_MS: u64 = 600_000;
 
 fn init_env() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: called before any engine (and thus any reader of the vars)
-        // exists in this test process.
-        unsafe { std::env::set_var("ZERON_TURN_QUIESCE_MS", QUIESCE_MS.to_string()) }
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("ZERON_TURN_QUIESCE_MS", QUIESCE_MS.to_string())
     });
 }
 
@@ -77,8 +62,6 @@ fn text(t: &str) -> AgentEvent {
     AgentEvent::TextDelta { text: t.into() }
 }
 
-/// Feed-by-hand harness (see `turn_quiesce.rs`): the test pushes events
-/// through a channel; accepted steers confirm with a `Steered` boundary.
 struct FeedHarness {
     main_prompt: String,
     feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
@@ -206,7 +189,6 @@ async fn parked_late_output_stays_idle() {
         .await
         .expect("dispatch");
 
-    // Turn 1 completes normally → parked Idle.
     rig.feed.send(session_started()).unwrap();
     rig.feed.send(text("I will watch the build.")).unwrap();
     rig.feed.send(done(DoneStatus::Completed)).unwrap();
@@ -216,7 +198,6 @@ async fn parked_late_output_stays_idle() {
     )
     .await;
 
-    // Background wake: late output after the completion boundary.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(text("The build is green. Released."))
@@ -254,9 +235,6 @@ async fn steered_turn_keeps_the_normal_window() {
     )
     .await;
 
-    // A real steer is the only event that opens a new turn. Its reply streams
-    // and goes quiet — with the normal window at 10 minutes, the session must
-    // STAY Working well past the test horizon (its Done is genuinely coming).
     rig.core
         .sessions
         .steer(CHAT, "and then?", None)
@@ -275,7 +253,6 @@ async fn steered_turn_keeps_the_normal_window() {
         "a live steered turn must not park before the normal watchdog window"
     );
 
-    // Clean turn end.
     rig.feed.send(done(DoneStatus::Completed)).unwrap();
     wait_for(
         || status(&rig.core) == Some(SessionStatus::Idle),

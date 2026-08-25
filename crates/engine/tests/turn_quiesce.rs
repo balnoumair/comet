@@ -1,21 +1,3 @@
-//! Turn-quiesce watchdog + parked self-continuation, mocked against the
-//! 2026-08-12 stuck-Working incident workflow (chat 15c8be78, Claude via
-//! claude-agent-acp — but the failure shape is harness-agnostic):
-//!
-//! 1. A turn completes (Done) → the session parks Idle.
-//! 2. The agent re-invokes ITSELF on a background-task notification and
-//!    streams late output with no prompt behind it. Treating that output as a
-//!    new turn re-armed Working without a matching Done.
-//! 3. A steer ("what about now") becomes the next turn — the agent answers,
-//!    and the turn-end reply is LOST upstream. No Done ever arrives; the
-//!    session read Working forever (the live heartbeat defeats the 45s
-//!    staleness gate by design, and there is no per-turn timeout).
-//!
-//! The fixes under test: completion is terminal while parked, only an
-//! explicit Steered boundary starts a new turn, and the quiesce watchdog
-//! settles any turn whose stream goes silent after completed output with
-//! nothing in flight.
-
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -33,15 +15,11 @@ use zeron_proto::{
 };
 
 const CHAT: &str = "chat-quiesce";
-/// Watchdog window for every test in this file (the process-global env knob
-/// is set once, before any engine assembles).
 const QUIESCE_MS: u64 = 300;
 
 fn init_quiesce_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // SAFETY: called before any engine (and thus any reader of the var)
-        // exists in this test process; all tests share the one value.
         unsafe { std::env::set_var("ZERON_TURN_QUIESCE_MS", QUIESCE_MS.to_string()) };
     });
 }
@@ -85,12 +63,6 @@ fn text(t: &str) -> AgentEvent {
     AgentEvent::TextDelta { text: t.into() }
 }
 
-/// Feed-by-hand harness: the test pushes events through a channel, so it can
-/// model turn boundaries, late adapter output, and a LOST turn-end exactly.
-/// Accepted steers are confirmed with a `Steered` boundary, like the ACP
-/// adapters do. The feed is served only to the test's own dispatch (matched
-/// by prompt) — the engine's auto-titler also runs this harness, and gets an
-/// immediately-completed empty stream instead.
 struct FeedHarness {
     main_prompt: String,
     feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
@@ -122,7 +94,6 @@ impl Harness for FeedHarness {
         mut controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         if request.prompt != self.main_prompt {
-            // The auto-titler's side run: complete instantly with nothing.
             let events = vec![Ok(done(DoneStatus::Completed))];
             return Ok(futures::stream::iter(events).boxed());
         }
@@ -137,8 +108,6 @@ impl Harness for FeedHarness {
             let mut steering_open = true;
             loop {
                 tokio::select! {
-                    // Steers first: a Steered boundary always precedes feed
-                    // events the test sends after steering (determinism).
                     biased;
                     steer = controls.steering.recv(), if steering_open => match steer {
                         Some(_) => {
@@ -198,8 +167,6 @@ fn status(core: &EngineCore) -> Option<SessionStatus> {
     core.sessions.session_status(CHAT).map(|s| s.status)
 }
 
-/// Tolerant read (see e2e.rs): a snapshot mid-segment-write deserializes with
-/// fields missing — treat that instant as "not yet".
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
     core.doc_host
         .open(CHAT)
@@ -241,10 +208,6 @@ where
     }
 }
 
-/// Steps 1+2 of the incident: a completed turn parks the session; late output
-/// from a background-task re-invocation must not reopen it. Completion stays
-/// terminal until an explicit steer boundary arrives, and the late output is
-/// treated as post-turn noise rather than a new transcript segment.
 #[tokio::test]
 async fn parked_late_output_does_not_reopen_working() {
     let rig = assemble("pull waku and benchmark it");
@@ -259,7 +222,6 @@ async fn parked_late_output_does_not_reopen_working() {
         .await
         .expect("dispatch");
 
-    // Turn 1 completes normally → parked Idle.
     rig.feed.send(session_started()).unwrap();
     rig.feed.send(text("Still going, and healthy.")).unwrap();
     rig.feed.send(done(DoneStatus::Completed)).unwrap();
@@ -269,8 +231,6 @@ async fn parked_late_output_does_not_reopen_working() {
     )
     .await;
 
-    // Late output with NO turn behind it, arriving well after the completion
-    // boundary, must remain parked instead of creating a phantom turn.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(text("Build finished successfully. Launching Waku."))
@@ -292,9 +252,6 @@ async fn parked_late_output_does_not_reopen_working() {
     rig.core.sessions.shutdown().await;
 }
 
-/// Step 3 of the incident: a steer becomes the next turn, the agent answers,
-/// and the turn-end reply is LOST. The session must not read Working forever
-/// — the watchdog settles it, and the answer text survives in the doc.
 #[tokio::test]
 async fn missing_turn_end_settles_instead_of_working_forever() {
     let rig = assemble("pull waku and benchmark it");
@@ -318,8 +275,6 @@ async fn missing_turn_end_settles_instead_of_working_forever() {
     )
     .await;
 
-    // "what about now" — routed into the live run's mailbox; the harness
-    // confirms it with a Steered boundary, which re-arms Working.
     let outcome = rig
         .core
         .sessions
@@ -333,11 +288,8 @@ async fn missing_turn_end_settles_instead_of_working_forever() {
     )
     .await;
 
-    // The agent answers… and its Done is lost upstream. Nothing else comes.
     rig.feed.send(text("Done — here are the results.")).unwrap();
 
-    // Old behavior: Working forever (heartbeat keeps the row fresh; no
-    // turn timeout). New behavior: the watchdog settles the turn.
     wait_for(
         || status(&rig.core) == Some(SessionStatus::Idle),
         "watchdog settles the turn whose Done was lost",
@@ -354,9 +306,6 @@ async fn missing_turn_end_settles_instead_of_working_forever() {
     rig.core.sessions.shutdown().await;
 }
 
-/// The guard the design comment insists on: a long-running tool call is
-/// legitimately silent for minutes — an unresolved tool part must hold the
-/// watchdog off no matter how long the stream is quiet.
 #[tokio::test]
 async fn open_tool_call_never_quiesces() {
     let rig = assemble("run the slow build");
@@ -387,7 +336,6 @@ async fn open_tool_call_never_quiesces() {
     )
     .await;
 
-    // Several full watchdog windows of silence mid-tool-call.
     tokio::time::sleep(Duration::from_millis(QUIESCE_MS * 4)).await;
     assert_eq!(
         status(&rig.core),
@@ -395,7 +343,6 @@ async fn open_tool_call_never_quiesces() {
         "an unresolved tool call must never quiesce"
     );
 
-    // The tool resolves and the turn ends normally.
     rig.feed
         .send(AgentEvent::ToolResult {
             id: "tool-slow".into(),
@@ -415,9 +362,6 @@ async fn open_tool_call_never_quiesces() {
     rig.core.sessions.shutdown().await;
 }
 
-/// Post-turn noise (the original eternally-running-session bug) must STILL be
-/// gated: a stale tool echo for an id folded in a prior segment does not
-/// resume a parked session.
 #[tokio::test]
 async fn stale_tool_echo_stays_parked() {
     let rig = assemble("do a thing");
@@ -454,8 +398,6 @@ async fn stale_tool_echo_stays_parked() {
     )
     .await;
 
-    // A late tool_call_update re-emitted as a full ToolCall for the OLD id
-    // must remain parked along with every other post-turn event.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     rig.feed
         .send(AgentEvent::ToolCall {
@@ -466,7 +408,6 @@ async fn stale_tool_echo_stays_parked() {
         })
         .unwrap();
 
-    // Give the echo ample time to (wrongly) resume the session.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         status(&rig.core),

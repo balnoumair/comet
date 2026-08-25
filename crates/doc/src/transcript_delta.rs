@@ -1,20 +1,8 @@
-//! Delta frames for `WatchDocMessages`.
-//!
-//! The watch used to re-serialize the entire transcript on every 120ms commit
-//! tick (measured at 1.13MB per frame on a 1.6MB chat, ~4 copies deep through
-//! the RPC hop). A frame is now either a full `reset` (first frame, and the
-//! fallback when a diff would approach transcript size) or the changed
-//! entries only — during streaming that is one entry per tick.
-//!
-//! Both viewports share this module (the `zeron_proto::view` rule: derivations
-//! that must not diverge per surface live in one place).
-
 use serde::{Deserialize, Serialize};
 
 use crate::parts::MessagePart;
 use crate::schema::SessionMessageEntry;
 
-/// One `WatchDocMessages` stream item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TranscriptFrame {
@@ -28,31 +16,21 @@ pub enum TranscriptFrame {
         append: Vec<TextAppend>,
         #[serde(default)]
         remove: Vec<String>,
-        /// Expected transcript length after applying this frame — the desync
-        /// tripwire: a consumer that lands elsewhere resubscribes for a reset.
         count: usize,
     },
 }
 
-/// An inserted or replaced entry, positioned after `after` (`None` = head).
-/// Anchors are prior upserts of the same frame or unchanged entries, so
-/// applying upserts in frame order always finds them settled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptUpsert {
     pub after: Option<String>,
     pub entry: SessionMessageEntry,
 }
 
-/// A pure text-tail append to one part — the streaming hot path. Entry-level
-/// upserts re-send the whole live entry per tick, which for a long single
-/// reply is the whole reply again (continuations re-join before the watch);
-/// this carries only the new tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextAppend {
     pub entry: String,
     pub part: String,
     pub text: String,
-    /// Total text length of the part after the append (desync tripwire).
     pub len: usize,
 }
 
@@ -72,9 +50,6 @@ impl TranscriptFrame {
     }
 }
 
-/// When `next` is `prev` plus text appended to exactly one text part (same
-/// position, all other fields and parts identical), the change is a
-/// [`TextAppend`]. Any other difference falls back to a full upsert.
 fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Option<TextAppend> {
     if prev.id != next.id
         || prev.role != next.role
@@ -109,10 +84,6 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
     append
 }
 
-/// Diff two transcript states into a frame. An entry is upserted when it is
-/// new, its content changed, or its predecessor changed (a Loro list merge can
-/// interleave an entry mid-list). Falls back to `Reset` when the delta
-/// would carry most of the transcript anyway.
 pub fn diff_transcript(
     prev: &[SessionMessageEntry],
     next: &[SessionMessageEntry],
@@ -158,7 +129,6 @@ pub fn diff_transcript(
         }
     }
 
-    // A delta touching most rows serializes like a reset but applies slower.
     if upsert.len() * 2 >= next.len().max(1) && next.len() > 4 {
         return TranscriptFrame::reset(next);
     }
@@ -170,13 +140,10 @@ pub fn diff_transcript(
     }
 }
 
-/// A frame that could not be applied cleanly — the consumer's copy has
-/// diverged (skew, missed frame) and it should resubscribe for a reset.
 #[derive(Debug, thiserror::Error)]
 #[error("transcript delta desync: {0}")]
 pub struct TranscriptDesync(pub String);
 
-/// Apply a frame in place. On any error the state is unreliable — resubscribe.
 pub fn apply_transcript_frame(
     current: &mut Vec<SessionMessageEntry>,
     frame: TranscriptFrame,
@@ -271,7 +238,6 @@ mod tests {
 
     fn apply(prev: &[SessionMessageEntry], next: &[SessionMessageEntry]) {
         let frame = diff_transcript(prev, next);
-        // Round-trip through JSON: the wire shape must survive serde.
         let json = serde_json::to_value(&frame).unwrap();
         let frame: TranscriptFrame = serde_json::from_value(json).unwrap();
         let mut current = prev.to_vec();
@@ -295,7 +261,6 @@ mod tests {
         let b = entry("b", "2");
         let c = entry("c", "3");
         apply(&[a.clone(), b.clone(), c.clone()], &[a.clone(), c.clone()]);
-        // Remote merge lands b between a and c.
         apply(&[a.clone(), c.clone()], &[a, b, c]);
     }
 
@@ -312,7 +277,6 @@ mod tests {
                 remove,
                 ..
             } => {
-                // The hot path: only the new tokens travel, never the entry.
                 assert!(upsert.is_empty());
                 assert_eq!(append.len(), 1);
                 assert_eq!(append[0].text, " more");
@@ -325,7 +289,6 @@ mod tests {
 
     #[test]
     fn non_append_change_falls_back_to_upsert() {
-        // Same id but a rewritten (non-prefix) text must re-send the entry.
         let b0 = entry("b", "draft text");
         let b1 = entry("b", "final");
         let frame = diff_transcript(&[b0.clone()], &[b1.clone()]);

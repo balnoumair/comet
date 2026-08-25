@@ -1,21 +1,3 @@
-//! Grok subagent visualization on the ACP path.
-//!
-//! Grok's wire frames carry no `parent_tool_use_id` (the docs promise
-//! tagging; unimplemented as of 1.0.4), and a subagent's interior transcript
-//! never appears on the parent's ACP stream — the wire only carries the
-//! lifecycle extension updates `subagent_spawned` / `subagent_progress` /
-//! `subagent_finished` (verified live, 1.0.4). The transcript itself is
-//! written incrementally to the child session's `chat_history.jsonl` under
-//! `~/.grok/sessions/<urlencoded-cwd>/<child_session_id>/`.
-//!
-//! So the tracker correlates the `spawn_subagent` tool call with its
-//! `subagent_spawned` update, tails the child's `chat_history.jsonl` into
-//! tagged [`AgentEvent::Subagent`] events (the engine routes those to the
-//! subagent's own doc and flips the spawn chip), and settles the chip with a
-//! tagged `Done` from `subagent_finished`. The on-disk format is
-//! vendor-private: every parse fails soft, degrading to chip + final output
-//! (from the wire's `subagent_finished`) rather than erroring the run.
-
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,15 +10,10 @@ use crate::HarnessError;
 
 use super::normalize::{OUTPUT_CAP, cap_text, xai_tool_name};
 
-/// Cadence of the transcript tail (the CLI appends at message granularity, so
-/// sub-second polling is plenty "live").
 const TAIL_POLL: Duration = Duration::from_millis(250);
-/// Post-`subagent_finished` drain: the wire signal can beat the CLI's last
-/// disk flush, so keep reading briefly before settling the tagged Done.
 const DRAIN_POLLS: u32 = 6;
 const DRAIN_POLL: Duration = Duration::from_millis(200);
 
-/// The default grok sessions root (`~/.grok/sessions`).
 fn default_sessions_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -45,7 +22,6 @@ fn default_sessions_root() -> PathBuf {
         .join("sessions")
 }
 
-/// Wrap an event as subagent-attributed traffic.
 fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
     AgentEvent::Subagent {
         parent_tool_use_id: parent.to_owned(),
@@ -61,37 +37,27 @@ fn done_status(status: &str) -> DoneStatus {
     }
 }
 
-/// A spawn chip (`spawn_subagent` tool call) not yet bound to a subagent id.
 struct PendingSpawn {
     tool_call_id: String,
     description: String,
 }
 
-/// The `subagent_finished` payload handed to a live tail.
 struct TailFinish {
     status: DoneStatus,
     output: String,
 }
 
-/// A `subagent_spawned` update that arrived before any chip could be bound
-/// (defensive: not an ordering grok exhibits today).
 struct SpawnedUnbound {
     child_session_id: String,
 }
 
 pub(crate) struct SubagentTracker {
-    /// The parent ACP session — `subagent_spawned` for a NESTED spawn (a
-    /// subagent's own subagent) must not bind to this feed's chips.
     session_id: String,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     sessions_root: PathBuf,
-    /// Spawn chips seen on the wire, FIFO, awaiting a subagent id.
     pending: VecDeque<PendingSpawn>,
-    /// subagent_id → the spawn chip's tool-use id.
     bound: HashMap<String, String>,
-    /// `subagent_spawned` payloads that could not bind yet.
     spawned_unbound: HashMap<String, SpawnedUnbound>,
-    /// subagent_id → finished-signal for the live tail task.
     tails: HashMap<String, oneshot::Sender<TailFinish>>,
 }
 
@@ -112,11 +78,6 @@ impl SubagentTracker {
         }
     }
 
-    /// Inspect one `session/update` payload's `update` object. Pure
-    /// bookkeeping — tagged events flow from the spawned tail tasks, which
-    /// hold their own `event_tx` clones (they outlive the turn: a background
-    /// subagent keeps streaming to its doc after the parent's Done, and the
-    /// event stream stays open until every tail settles).
     pub(crate) fn observe(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("tool_call") | Some("tool_call_update") => self.observe_tool_call(update),
@@ -149,10 +110,6 @@ impl SubagentTracker {
                 }),
             }
         }
-        // The spawn's completion echoes the minted id in its output text
-        // ("subagent_id: <uuid>") — the completed update carries no _meta, so
-        // key off membership in `pending` instead. Background spawns complete
-        // here BEFORE `subagent_spawned` arrives; sync spawns after.
         if update.get("status").and_then(Value::as_str) == Some("completed")
             && self.pending.iter().any(|p| p.tool_call_id == id)
             && let Some(sub_id) = spawn_output_subagent_id(update)
@@ -166,8 +123,6 @@ impl SubagentTracker {
     }
 
     fn observe_spawned(&mut self, update: &Value) {
-        // A nested spawn (a subagent spawning its own subagent) would carry
-        // the CHILD's session id here — never bind it to this feed's chips.
         if let Some(parent) = update.get("parent_session_id").and_then(Value::as_str)
             && parent != self.session_id
         {
@@ -187,9 +142,6 @@ impl SubagentTracker {
             .unwrap_or(sub_id)
             .to_owned();
         if !self.bound.contains_key(sub_id) {
-            // Sync spawns: the chip hasn't completed yet — bind by
-            // description (FIFO across identical descriptions, matching
-            // grok's spawn order), else the oldest pending spawn.
             let description = update
                 .get("description")
                 .and_then(Value::as_str)
@@ -208,8 +160,6 @@ impl SubagentTracker {
                     self.bound.insert(sub_id.to_owned(), p.tool_call_id);
                 }
                 None => {
-                    // No chip candidate on the wire (yet): stash — the
-                    // spawn completion's id echo binds it later.
                     self.spawned_unbound
                         .insert(sub_id.to_owned(), SpawnedUnbound { child_session_id });
                     return;
@@ -240,9 +190,6 @@ impl SubagentTracker {
         if let Some(tx) = self.tails.remove(sub_id) {
             let _ = tx.send(finish);
         } else if let Some(parent) = self.bound.get(sub_id).cloned() {
-            // No tail ever started (the chip bound but `subagent_spawned`
-            // never arrived, or the tail task failed to spawn): the wire's
-            // final output still makes a transcript, and the chip settles.
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
                 if !finish.output.is_empty() {
@@ -289,7 +236,6 @@ impl SubagentTracker {
     }
 }
 
-/// `subagent_id: <id>` from the spawn tool call's completion output.
 fn spawn_output_subagent_id(update: &Value) -> Option<String> {
     let text = update
         .get("rawOutput")
@@ -308,14 +254,6 @@ fn spawn_output_subagent_id(update: &Value) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Disk tail
-// ---------------------------------------------------------------------------
-
-/// The child session's `chat_history.jsonl`, located by session id ONE level
-/// under the sessions root (`<root>/<urlencoded-cwd>/<child_session_id>/`) —
-/// scanning dodges reimplementing grok's cwd encoding, and the child's cwd
-/// can differ from the parent's anyway.
 fn locate_history(root: &Path, child_session_id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
@@ -330,8 +268,6 @@ fn locate_history(root: &Path, child_session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Incremental line reader over an append-only JSONL file. A partial trailing
-/// line (a write raced mid-append) carries over to the next poll.
 struct TailReader {
     path: PathBuf,
     offset: u64,
@@ -347,8 +283,6 @@ impl TailReader {
         }
     }
 
-    /// New complete entries since the last poll; io/parse failures read as
-    /// "nothing new" (fail soft — the format is vendor-private).
     fn read_new(&mut self) -> Vec<Value> {
         use std::io::{Read as _, Seek as _};
         let Ok(mut file) = std::fs::File::open(&self.path) else {
@@ -374,10 +308,6 @@ impl TailReader {
     }
 }
 
-/// Map one `chat_history.jsonl` entry to (untagged) transcript events.
-/// Message-granularity by construction — grok only writes settled messages;
-/// the trailing `\n\n` keeps consecutive message-level chunks readable when
-/// the fold concatenates them.
 fn entry_events(entry: &Value) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     match entry.get("type").and_then(Value::as_str) {
@@ -419,7 +349,6 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
                 if id.is_empty() || name.is_empty() {
                     continue;
                 }
-                // `arguments` is a JSON-encoded STRING on disk.
                 let args = tc
                     .get("arguments")
                     .and_then(Value::as_str)
@@ -451,10 +380,6 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
             }
         }
         Some("user") => {
-            // The message INTO the subagent — its spawn prompt (and any
-            // future steer): its own user entry in the subagent doc, like
-            // the chat it is. Synthetic context injections (reminder-style
-            // tagged blocks) are not conversation.
             if let Some(text) = entry
                 .get("content")
                 .and_then(Value::as_str)
@@ -466,13 +391,11 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
                 });
             }
         }
-        // system prompt / synthetic reminders: not transcript.
         _ => {}
     }
     events
 }
 
-/// Type a grok-native tool invocation (disk names, not ACP kinds).
 fn grok_tool_call(name: &str, args: &Value) -> ToolCall {
     let s = |keys: &[&str]| {
         keys.iter()
@@ -507,8 +430,6 @@ fn grok_tool_call(name: &str, args: &Value) -> ToolCall {
         "web_search" => ToolCall::WebSearch {
             query: s(&["query", "search_term"]).unwrap_or_default(),
         },
-        // A nested spawn inside the subagent: same naming as the parent chip
-        // (no recursive tail — it renders as a plain chip in the child doc).
         "spawn_subagent" => ToolCall::Unknown {
             name: s(&["description"])
                 .map(|d| format!("Agent: {d}"))
@@ -522,11 +443,6 @@ fn grok_tool_call(name: &str, args: &Value) -> ToolCall {
     }
 }
 
-/// One subagent's transcript tail: poll the child's `chat_history.jsonl`
-/// into tagged events until `subagent_finished` (or tracker teardown), then
-/// drain briefly and settle the chip with a tagged Done. Holds its own
-/// `event_tx` clone, so the run's event stream stays open until the tail
-/// settles — an agent that dies mid-subagent still gets its chip closed.
 async fn tail_task(
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     root: PathBuf,
@@ -565,9 +481,6 @@ async fn tail_task(
         }
         tokio::select! {
             fin = &mut finished_rx => {
-                // A dropped sender is session teardown with the subagent
-                // still running: settle the chip as interrupted rather than
-                // leaving it spinning forever.
                 break fin.unwrap_or(TailFinish {
                     status: DoneStatus::Interrupted,
                     output: String::new(),
@@ -577,8 +490,6 @@ async fn tail_task(
         }
     };
 
-    // The finished signal can beat the CLI's last disk flush: drain until a
-    // quiet poll (or the budget), then settle.
     for i in 0..DRAIN_POLLS {
         let events = pump(&mut reader);
         for ev in events.iter().cloned() {
@@ -597,8 +508,6 @@ async fn tail_task(
         tokio::time::sleep(DRAIN_POLL).await;
     }
     if !emitted && !finish.output.is_empty() {
-        // The tail never found (or never parsed) the transcript: the wire's
-        // final output alone still makes a useful doc.
         if event_tx
             .send(Ok(tag(
                 &parent_tool_use_id,
@@ -642,7 +551,6 @@ mod tests {
             spawn_output_subagent_id(&update).as_deref(),
             Some("01a0-abc")
         );
-        // content-block fallback when rawOutput is absent.
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "t1",
@@ -654,7 +562,6 @@ mod tests {
 
     #[test]
     fn chat_history_entries_map_to_transcript_events() {
-        // Real shapes from ~/.grok/sessions (grok 1.0.4).
         let reasoning = json!({
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": "The user wants a probe.\n"}],
@@ -698,16 +605,16 @@ mod tests {
             [AgentEvent::TextDelta { text }] if text == "finished\n\n"
         ));
 
-        // The message INTO the subagent is its own user entry; system
-        // entries and reminder-style synthetic injections are skipped.
         assert!(matches!(
             entry_events(&json!({"type": "user", "content": "scan the fold path"})).as_slice(),
             [AgentEvent::UserMessage { text }] if text == "scan the fold path"
         ));
         assert!(entry_events(&json!({"type": "system", "content": "x"})).is_empty());
         assert!(
-            entry_events(&json!({"type": "user", "content": "<system-reminder>tick</system-reminder>"}))
-                .is_empty()
+            entry_events(
+                &json!({"type": "user", "content": "<system-reminder>tick</system-reminder>"})
+            )
+            .is_empty()
         );
     }
 

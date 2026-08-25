@@ -1,8 +1,3 @@
-//! Synced entity rows (workspace doc) and local projections.
-//!
-//! In zeron these were synced Postgres rows; in zeron they live in the per-org
-//! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -15,48 +10,30 @@ pub struct Device {
     pub name: String,
     pub platform: String,
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// First registration time (zeron devices.created_at — the Devices page
-    /// "Added …" fragment). Optional so pre-existing docs stay readable.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
-    /// App version the device's engine last booted with — fleet staleness at a
-    /// glance (Devices page). Optional so pre-existing docs stay readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-/// A synced (device, folder) pair — the unit of organization in the sidebar.
-/// Sessions belong to exactly one space; the space fixes their host device and
-/// base cwd. Folders need not be git repos: `git_detected` is stamped by the
-/// owning device (SpacesSync) and gates branch pickers / the diff sidebar on
-/// every device without an RPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Space {
     pub id: String,
-    /// Owning device — fixed at create, immutable.
     pub device_id: String,
-    /// Absolute folder path on the owning device.
     pub path: String,
-    /// User rename; absent ⇒ display = basename(path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Owner-stamped: is `path` inside a git work tree?
     #[serde(default)]
     pub git_detected: bool,
-    /// Owner-stamped freshness timestamp of the last git check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_checked_at: Option<DateTime<Utc>>,
-    /// Owner-stamped when git: canonical checkout identity of the space root
-    /// (sha256(deviceId ‖ NUL ‖ git_dir)) — diff grouping key for root sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 impl Space {
-    /// Name override, else basename(path), else the path itself.
-    /// Lives here (proto) so UI and engine agree on the derivation.
     pub fn display_name(&self) -> &str {
         if let Some(name) = self.name.as_deref()
             && !name.trim().is_empty()
@@ -87,43 +64,27 @@ pub struct ChatConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
     pub id: String,
-    /// Owning (host) device.
     pub device_id: String,
     pub title: Option<String>,
     pub archived: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
-    /// Canonical id of the repo checkout/worktree this chat operates in.
     pub checkout_id: Option<String>,
     pub config: Option<ChatConfig>,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (zeron's `chats.harness_session_id`).
-    /// Empty string = explicit
-    /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_id: Option<String>,
-    /// Cwd the harness session was created under. Harness session stores are
-    /// cwd-scoped (claude keys conversations by project directory), so resume
-    /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
-    /// The space this chat belongs to. Invariant: `Some` for every UI-created
-    /// chat; rows with a missing/dangling space id are not rendered (the host
-    /// device's repair sweep deletes its own danglers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
-    /// Synced LWW seen marker — compared against `last_message_at` to derive
-    /// the "completed (finished but unseen)" indicator. Reading a chat on any
-    /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 impl Chat {
-    /// True when the chat has activity the user hasn't seen on any device.
     pub fn unseen(&self) -> bool {
         match (self.last_message_at, self.last_seen_at) {
             (Some(msg), Some(seen)) => msg > seen,
@@ -133,21 +94,16 @@ impl Chat {
     }
 }
 
-/// Display status for a chat row/tab: the four user-facing states plus a
-/// distinct Errored. Derived — never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatIndicator {
     Working,
     AwaitingInput,
     Errored,
-    /// Finished running (or errored out) but not seen yet on any device.
     Completed,
     Idle,
 }
 
-/// Derive the display status. `live` must already be staleness-gated by the
-/// caller (the UI's 45s window) — pass `None` for a stale/absent session row.
 pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
     match live.map(|s| s.status) {
         Some(SessionStatus::Working) => ChatIndicator::Working,
@@ -156,6 +112,43 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
         _ if chat.unseen() => ChatIndicator::Completed,
         _ => ChatIndicator::Idle,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indicator {
+    None,
+    Working,
+    AwaitingInput,
+    Errored,
+}
+
+pub const SESSION_STALE_MS: i64 = 45_000;
+
+pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Indicator {
+    let Some(session) = session else {
+        return Indicator::None;
+    };
+    match session.status {
+        SessionStatus::Idle => Indicator::None,
+        SessionStatus::Errored => Indicator::Errored,
+        SessionStatus::Working | SessionStatus::AwaitingInput => {
+            let age_ms = now
+                .signed_duration_since(session.updated_at)
+                .num_milliseconds();
+            if age_ms > SESSION_STALE_MS {
+                Indicator::None
+            } else if session.status == SessionStatus::Working {
+                Indicator::Working
+            } else {
+                Indicator::AwaitingInput
+            }
+        }
+    }
+}
+
+pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
+    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
+    chat_indicator(chat, live)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,9 +160,6 @@ pub enum SessionStatus {
     Errored,
 }
 
-/// Live run status for a chat — drives the Working indicator and sidebar status dots.
-/// Staleness-checked client-side against `updated_at` so a crashed backend never shows
-/// an eternal "Working".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -188,23 +178,16 @@ pub struct Repo {
     pub default_branch: Option<String>,
 }
 
-/// One row of `ListRefs`: a branch plus its checkout state — whether it is
-/// the repo's current (main-checkout) branch and whether it is materialized
-/// as a linked worktree. Drives the composer's ref picker (`current` /
-/// `worktree` tags) and the checkout-kind selector.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoRef {
     pub name: String,
-    /// Checked out in the repo's MAIN folder right now.
     #[serde(default)]
     pub current: bool,
-    /// Path of the linked worktree this branch is checked out in, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
 }
 
-/// Public Git reference attached to a commit in the history graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GitHistoryRefKind {
@@ -220,7 +203,6 @@ pub struct GitHistoryRef {
     pub label: String,
 }
 
-/// One topologically ordered row in the repository history graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistoryCommit {
@@ -241,7 +223,6 @@ pub struct GitHistoryPage {
     pub head_sha: Option<String>,
     pub next_cursor: Option<usize>,
     pub total_count: Option<usize>,
-    /// Number of commits reachable from the active checkout's HEAD.
     #[serde(default)]
     pub head_commit_count: Option<usize>,
 }
@@ -252,10 +233,8 @@ pub struct Worktree {
     pub repo_path: String,
     pub path: String,
     pub branch: String,
-    /// Generated worktree folder name (`zeron/<name>` is its branch).
     #[serde(default)]
     pub name: String,
-    /// Canonical checkout identity (device-scoped hash of the git dir).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
 }
@@ -273,14 +252,10 @@ pub struct FolderEntry {
 pub struct FolderListing {
     pub path: String,
     pub entries: Vec<FolderEntry>,
-    /// True when the listing hit the entry cap.
     #[serde(default)]
     pub truncated: bool,
 }
 
-/// A workspace-relative file or directory returned by `SearchFiles`.
-/// Contents deliberately never cross this boundary: mentioning a path leaves
-/// the harness to read it through its normal workspace tools when needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchMatch {
@@ -292,7 +267,6 @@ pub struct FileSearchMatch {
 #[serde(rename_all = "camelCase")]
 pub struct DiffFileSummary {
     pub path: String,
-    /// Previous path for renames/copies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
     pub status: String,
@@ -302,7 +276,6 @@ pub struct DiffFileSummary {
     pub binary: bool,
 }
 
-/// Working-tree diff for a checkout — latest-only sidecar, 3MiB patch cap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutDiff {
@@ -313,7 +286,6 @@ pub struct CheckoutDiff {
     pub files: Vec<DiffFileSummary>,
     pub additions: u32,
     pub deletions: u32,
-    /// True when the patch was truncated at the byte cap ("Partial snapshot").
     pub truncated: bool,
     pub checksum: String,
     pub updated_at: DateTime<Utc>,
@@ -331,9 +303,6 @@ pub struct GetCheckoutFileDiffTextRequest {
     pub base_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
-    /// Pinned commit for History's per-commit diff scope. When present, the
-    /// source pair is read from the commit parent and this commit, never from
-    /// the live working tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_sha: Option<String>,
     pub diff_checksum: String,
@@ -393,14 +362,10 @@ pub struct AgentAccount {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization: Option<String>,
-    /// How the CLI is signed in (`oauth` account vs raw `api-key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_kind: Option<AgentAuthKind>,
-    /// False for a live login whose credentials we could not read (e.g. macOS
-    /// Keychain denied) — shown, but not re-activatable.
     #[serde(default)]
     pub switchable: bool,
-    /// Epoch millis of the slot's last snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<i64>,
 }
@@ -412,7 +377,6 @@ pub enum AgentAuthKind {
     ApiKey,
 }
 
-/// Everything the Accounts settings page renders, rebuilt after every mutation.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountsSnapshot {
@@ -420,7 +384,6 @@ pub struct AgentAccountsSnapshot {
     pub warnings: Vec<AgentAccountWarning>,
 }
 
-/// A per-harness detection warning (e.g. Keychain denied reading the live login).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountWarning {
@@ -428,8 +391,6 @@ pub struct AgentAccountWarning {
     pub message: String,
 }
 
-/// `StartAgentLogin` reply: open `url`, then either paste the code back
-/// (`CompleteAgentLogin`) or poll until the browser flow lands (`PollAgentLogin`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLoginStart {
@@ -441,9 +402,7 @@ pub struct AgentLoginStart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentLoginMode {
-    /// Claude: the user pastes the OAuth code back into the app.
     PasteCode,
-    /// Codex: the CLI's loopback callback completes in the browser; poll until done.
     Browser,
 }
 
@@ -463,33 +422,29 @@ pub enum AgentLoginStatus {
     Error,
 }
 
-/// CLI plan rate-limit window (accounts settings meters) — NOT app token accounting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsageWindow {
     pub label: String,
-    /// 0.0..=1.0
     pub used_fraction: f32,
     pub resets_at: Option<DateTime<Utc>>,
 }
 
-/// An open PTY session on the owning device (`OpenTerminal` reply).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSession {
     pub id: String,
     pub cwd: String,
-    /// Shell basename (`zsh`, `bash`, …) for the tab label.
     pub shell: String,
 }
 
-/// One `SubscribeTerminal` stream item. `seq` is a per-terminal monotonic counter
-/// used for replay resumption (`afterSeq`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TerminalEvent {
-    /// Output chunk; `data` is base64 (PTY output is raw bytes, not valid UTF-8).
-    Data { seq: u64, data: String },
+    Data {
+        seq: u64,
+        data: String,
+    },
     #[serde(rename_all = "camelCase")]
     Exit {
         seq: u64,

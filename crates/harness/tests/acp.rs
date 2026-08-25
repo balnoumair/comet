@@ -1,6 +1,3 @@
-//! AcpHarness integration tests against the fake ACP agent in
-//! `tests/fixtures/fake-acp.sh` (no real `grok` binary involved).
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -96,7 +93,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;
 
-    // SessionStarted from session/new's id.
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -106,7 +102,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         "{events:?}"
     );
 
-    // Initialize-advertised commands surface before the turn.
     let commands: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -117,10 +112,8 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     assert_eq!(commands.len(), 2, "{events:?}");
     assert_eq!(commands[0][0].name, "compact");
     assert_eq!(commands[0][1].input_hint.as_deref(), Some("the goal"));
-    // Mid-run advertisement replaces the list.
     assert_eq!(commands[1][0].name, "deep-research");
 
-    // Chunks; the wrong-session and non-text chunks never surface.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "Hello".into()
     }));
@@ -134,8 +127,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         "{events:?}"
     );
 
-    // Execute tool: pending opens the call, the completed update resolves it
-    // with capped multi-line output (newlines preserved verbatim).
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "t1".into(),
         call: ToolCall::Exec {
@@ -157,7 +148,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     assert!(exec_output.starts_with("   Compiling zeron-harness"));
     assert_eq!(exec_output.lines().count(), 6, "{exec_output:?}");
 
-    // Edit tool: single-shot completed call carries the inline diff.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "t2".into(),
         call: ToolCall::EditFile {
@@ -186,7 +176,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     );
     assert!(diff.new_text.contains("split_paths"), "{diff:?}");
 
-    // Plan → stable todo chip.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "acp-plan".into(),
         call: ToolCall::Todo {
@@ -203,7 +192,6 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         },
     }));
 
-    // usage_update maps to nothing (context gauge, not per-turn tokens).
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
 
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
@@ -215,8 +203,6 @@ async fn config_options_apply_requested_model_and_effort() {
     let mut req = request("scenario:config");
     req.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
     let events = run_to_end(&harness(), req, controls).await;
-    // The fixture answers refusal unless BOTH set_config_option calls
-    // (model grok-4.5, effort medium) arrived before the prompt.
     assert!(
         events.contains(&AgentEvent::TextDelta {
             text: "configured".into()
@@ -245,7 +231,6 @@ async fn resumed_first_class_model_is_switched_before_prompt() {
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
-    // The fixture answers refusal unless the harness selected "always".
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "approved".into()
     }));
@@ -293,11 +278,6 @@ async fn steering_extension_injects_mid_turn() {
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
-/// The steering response racing the turn's own end: the injection landed in
-/// the dying turn, and the prompt response reached the wire first. The
-/// boundary must still be emitted BEFORE the Done — a Steered after Done
-/// re-armed the consumer (parked session → Working) with no next turn and no
-/// Done ever coming (the stranded-Working / eternal-timer bug).
 #[tokio::test]
 async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
     let (controls, steer, _token) = controls();
@@ -371,8 +351,6 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
                     .await
                     .expect("steer sent");
             }
-            // Close the mailbox once the boundary turn streams so the
-            // persistent session winds down and the stream ends.
             if matches!(ev, AgentEvent::TextDelta { ref text } if text == "boundary") {
                 steer = None;
             }
@@ -383,7 +361,6 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
     .await
     .expect("run finished in time");
 
-    // First turn completes, then the queued steer becomes the boundary turn.
     assert_eq!(
         dones(&events),
         vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
@@ -468,14 +445,12 @@ async fn resume_loads_the_session_and_drops_replayed_history() {
     let mut req = request("scenario:resumed");
     req.resume = Some("s-loaded".into());
     let events = run_to_end(&harness(), req, controls).await;
-    // The 600-update replay is drained without surfacing…
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("old reply"))),
         "{events:?}"
     );
-    // …the loaded session id sticks, and the live turn still streams.
     assert!(events.iter().any(|e| matches!(
         e,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "s-loaded"
@@ -504,13 +479,10 @@ fn descriptor_surface_matches_registry_expectations() {
 
 #[tokio::test]
 async fn models_are_discovered_from_the_acp_session() {
-    // ACP is the source of truth: the fixture advertises a model config
-    // option, so the picker list comes from the wire, not the static catalog.
     let harness = AcpHarness::hermes().with_executable(fixture_path());
     let models = harness.models().await.expect("discovery");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["grok-4-fast", "grok-4.5"], "{models:?}");
-    // Unmatched ids inherit the probe session's thought_level ladder.
     assert_eq!(
         models[0].reasoning_levels,
         vec![
@@ -521,15 +493,12 @@ async fn models_are_discovered_from_the_acp_session() {
         "{models:?}"
     );
     assert_eq!(models[0].description.as_deref(), Some("Fast tier"));
-    // Cached: a second call returns the same list without respawning.
     let again = harness.models().await.expect("cached");
     assert_eq!(again, models);
 }
 
 #[tokio::test]
 async fn models_enrich_from_the_static_catalog_on_id_match() {
-    // grok's static catalog knows "grok-4.5" — the discovered entry keeps the
-    // wire label but inherits the curated description and ladder.
     let harness = AcpHarness::grok().with_executable(fixture_path());
     let models = harness.models().await.expect("discovery");
     let grok45 = models
@@ -580,14 +549,9 @@ async fn opencode_model_timeout_is_not_hidden_by_the_static_catalog() {
 #[cfg(unix)]
 #[tokio::test]
 async fn hung_handshake_errors_instead_of_spinning_forever() {
-    // An agent that consumes stdin and never answers initialize — the
-    // "thinking for minutes, then nothing" startup class (issue #93). The
-    // run must end with a Done that names the timeout, not hang.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("hung-agent.sh");
-    // sleep inherits the stdio pipes and holds them open without ever
-    // answering — a true wedge, not a crash.
     std::fs::write(&script, "#!/bin/sh\nexec sleep 1000\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -620,8 +584,6 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(opencode.display_name(), "OpenCode");
     assert!(opencode.supports_steering());
     assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
-    // Effort rides opencode's model variants (the session's `effort` config
-    // option, category thought_level); variant-less models skip the set.
     assert_eq!(
         opencode.reasoning_levels(),
         &[
@@ -653,8 +615,6 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
 
 #[tokio::test]
 async fn prompt_complete_extension_settles_a_hung_prompt_response() {
-    // The grok field hang: `_x.ai/session/prompt_complete` fires (echoing
-    // the minted _meta.promptId) but the session/prompt RPC never answers.
     let (controls, _steer, _token) = controls();
     let mut stream = harness()
         .run(request("scenario:prompt-complete-hang"), controls)
@@ -707,9 +667,6 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
     })
     .await
     .expect("real response settled the turn");
-    // Exactly one Done, AFTER the real content — the stale/foreign
-    // completions (emitted before the 1s pause) must not have settled first,
-    // and must not have marked the turn Interrupted.
     let text = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "real answer"))
@@ -726,7 +683,6 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
             ..
         }
     ));
-    // Grok-style `_meta` usage on the response is captured.
     assert!(events.contains(&AgentEvent::Usage {
         input_tokens: 9,
         output_tokens: 4
@@ -735,9 +691,6 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
 
 #[tokio::test]
 async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() {
-    // The child session's chat_history.jsonl, one level under the sessions
-    // root exactly like grok's `<root>/<urlencoded-cwd>/<session-id>/` layout
-    // (entry shapes captured from a real 1.0.4 run).
     let tmp = tempfile::tempdir().unwrap();
     let child_dir = tmp.path().join("%2Ftmp").join("sub-1");
     std::fs::create_dir_all(&child_dir).unwrap();
@@ -753,8 +706,6 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
         ),
     )
     .unwrap();
-    // A mid-run append: the tail must pick it up incrementally, before the
-    // wire's subagent_finished lands (the fake agent sleeps 1.4s).
     let append_to = history.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -775,7 +726,6 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
     let harness = harness().with_sessions_root(tmp.path());
     let events = run_to_end(&harness, request("scenario:subagent"), controls).await;
 
-    // The spawn chip is named after the task, claude-driver parity.
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -785,9 +735,6 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
         "{events:?}"
     );
 
-    // Tagged transcript: every wrapped event attributes to the spawn chip,
-    // and the disk entries surfaced in order — reasoning, the typed tool
-    // call + result, the mid-run append — then the lifecycle Done.
     let tagged: Vec<&AgentEvent> = events
         .iter()
         .filter_map(|e| match e {
@@ -839,8 +786,5 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
         reasoning < tool && tool < result && result < text && text < done,
         "{tagged:?}"
     );
-    // The nested spawned update (another parent session) bound nothing —
-    // every wrapped event attributed to sp1 (the assert in the filter) — and
-    // the parent's own turn settled cleanly with its single untagged Done.
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }

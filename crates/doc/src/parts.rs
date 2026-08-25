@@ -1,31 +1,11 @@
-//! Message parts: the event fold, the render-only privacy policy, and continuation splitting.
-//!
-//! The fold and render helpers share the local session document schema.
-
 use serde::{Deserialize, Serialize};
 
 use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
-/// Char cap for the tool-output summary persisted into the local document:
-/// non-empty line, nothing more. The per-part 4KB cap (c951c3e) bounded each
-/// Full output remains in the local run journal when the bounded preview is
-/// not enough.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// The doc-resident form of a tool output. The full text survives in the
-/// host's local run journal when the bounded preview is not enough:
-///
-/// - Markdown code fences are stripped first — ACP harnesses fence every
-///   output, so the fence is transport wrapping, never content (pre-fix,
-///   every summary read "```console…").
-/// - Outputs that fit [`TOOL_OUTPUT_SUMMARY_MAX`] chars ride whole — a
-///   summary of a two-line output is more UI than the output.
-/// - Bigger outputs keep the first non-empty line, capped, with a `…`
-///   marker meaning "there was more".
-///
-/// `None` for blank output.
 pub fn summarize_tool_output(text: &str) -> Option<String> {
     let kept: Vec<&str> = text
         .lines()
@@ -39,9 +19,6 @@ pub fn summarize_tool_output(text: &str) -> Option<String> {
     if stripped.chars().count() <= TOOL_OUTPUT_SUMMARY_MAX {
         return Some(stripped.to_owned());
     }
-    // Too big to inline: first non-empty line, capped. There is always more
-    // than the summary here (whole output exceeded the budget), so the
-    // marker is unconditional.
     let line = stripped
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -61,7 +38,6 @@ pub fn summarize_tool_output(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Per-file diff stats persisted alongside bounded inline diff text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDiffStat {
@@ -70,7 +46,6 @@ pub struct ToolDiffStat {
     pub deletions: u64,
 }
 
-/// Line-level add/delete counts for one file's diff.
 pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
     let (additions, deletions) = match &diff.old_text {
         None => (diff.new_text.lines().count() as u64, 0),
@@ -103,7 +78,6 @@ pub enum MessageStatus {
     Aborted,
 }
 
-/// Lifecycle of a spawned subagent, carried on its spawn chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubagentStatus {
@@ -112,7 +86,6 @@ pub enum SubagentStatus {
     Failed,
 }
 
-/// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MessagePart {
@@ -126,43 +99,24 @@ pub enum MessagePart {
         call: ToolCall,
         #[serde(default)]
         is_error: bool,
-        /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
-        /// One-line tool output summary ([`summarize_tool_output`]). Old
-        /// entries (pre-strip) still carry up to 4KB here; old app versions
-        /// render this field either way, so the strip is invisible to them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
-        /// Inline file diff, retained for readable local snapshots.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
-        /// Legacy local snapshot key for a full output, if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_ref: Option<String>,
-        /// Full-output byte length, so the UI can say "Show full output (12 KB)".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_bytes: Option<u64>,
-        /// Legacy local snapshot key for a full diff JSON, if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_ref: Option<String>,
-        /// Per-file diff stats (additive replacement for inline `diff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
-        /// The SUBAGENT doc id this spawn chip indexes (additive; stamped by
-        /// the engine like the sidecar refs — the fold is chat-agnostic).
-        /// The chip IS the index: the client learns the doc/blob id from it,
-        /// there is no listing endpoint.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_ref: Option<String>,
-        /// Subagent lifecycle, DISTINCT from `resolved`: under the eager-done
-        /// policy the spawn tool's own result lands while the subagent still
-        /// runs. `running` → the ref is a live doc (watch it); `done`/
-        /// `failed` → frozen (blob first, doc as fallback).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_status: Option<SubagentStatus>,
-        /// One-line live tail of the subagent's latest output, folded from
-        /// its tagged text deltas (capped; display-only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_tail: Option<String>,
     },
@@ -217,19 +171,6 @@ impl MessagePart {
     }
 }
 
-/// Fold one agent event into a parts accumulator, in place.
-///
-/// In place because the fold runs once per streamed event: rebuilding the
-/// accumulator each time made long turns O(n²) in allocations.
-///
-/// Semantics from zeron `foldEventIntoParts`:
-/// - `SessionStarted` / `Steered` reset the accumulator (turn boundary — makes replay safe).
-/// - `TextDelta` appends to the trailing text part, or starts a new one if the trail is not text
-///   (a tool call in between breaks the text block).
-/// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
-/// - `ToolResult` marks the matching tool part resolved / errored in place.
-/// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
-/// - `Error` and `Done{error}` become visible error parts.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
@@ -246,9 +187,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::ReasoningDelta { .. } => {
-            // Reasoning is not rendered as a transcript part (matches zeron).
-        }
+        AgentEvent::ReasoningDelta { .. } => {}
         AgentEvent::ToolCall { id, call } => {
             if let Some(existing) = out.iter_mut().find_map(|p| match p {
                 MessagePart::Tool {
@@ -296,12 +235,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool outputs stay out of the bounded transcript row;
-                    // full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
+                    let _ = output;
                     *out_slot = None;
                     *output_bytes = None;
                     *diff_slot = None;
@@ -352,13 +286,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        // Subagent-attributed CONTENT belongs to the subagent's own doc (the
-        // engine routes it there); the parent doc keeps only the spawn chip —
-        // which these events refresh in place: LIFECYCLE ONLY. A live tail
-        // was tried and rejected: rewriting the chip per delta batch grew
-        // the parent doc's oplog for the whole subagent run and rendered as
-        // distracting mid-stream fragments (user call, 2026-08-18). The
-        // `subagent_tail` field stays in the schema for docs that carry it.
         AgentEvent::Subagent {
             parent_tool_use_id,
             event,
@@ -380,8 +307,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     match status {
                         Some(s) => *subagent_status = Some(s),
-                        // Any tagged traffic proves the subagent is live;
-                        // never regress a terminal state.
                         None if !matches!(
                             subagent_status,
                             Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
@@ -394,8 +319,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
-        // AvailableCommands feeds the engine's per-harness command cache, not
-        // the transcript.
         AgentEvent::UserMessage { .. }
         | AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
@@ -403,12 +326,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     }
 }
 
-/// Stamp stable local keys onto resolved tool parts that have full payloads.
-///
-/// Separate from the fold because the fold is chat-agnostic and pure; the
-/// caller (who knows the chat id) runs this right after each fold step, before
-/// the parts hit the doc. Idempotent. Key shape `{chatId}/{partId}` (+
-/// `.diff`) is stable within local snapshots.
 pub fn apply_sidecar_refs(chat_id: &str, parts: &mut [MessagePart]) {
     for part in parts.iter_mut() {
         if let MessagePart::Tool {
@@ -431,7 +348,6 @@ pub fn apply_sidecar_refs(chat_id: &str, parts: &mut [MessagePart]) {
     }
 }
 
-/// Full local payload associated with a tool result, keyed by part id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidecarPayload {
     pub part_id: String,
@@ -457,11 +373,6 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
     })
 }
 
-/// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
-///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
-/// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
         ToolCall::WriteFile { path, .. } => ToolCall::WriteFile {
@@ -490,16 +401,10 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     }
 }
 
-/// Deterministic continuation id: `"{root}#c{n}"`.
 pub fn continuation_id(root: &str, index: usize) -> String {
     format!("{root}#c{index}")
 }
 
-/// Split an oversized parts list into chunks each under `MSG_INLINE_MAX` bytes.
-///
-/// Splitting happens at part boundaries; an oversized text part is itself chunked at char
-/// boundaries. Returns one Vec per resulting entry — the first keeps the root id, the rest are
-/// continuations (`continuation_id(root, i)`), matching `splitMessageEntry` in zeron.
 pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
     let mut chunks: Vec<Vec<MessagePart>> = vec![Vec::new()];
     let mut current_bytes = 0usize;
@@ -517,7 +422,6 @@ pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
     for part in parts {
         match part {
             MessagePart::Text { id, text } if text.len() > MSG_INLINE_MAX => {
-                // Chunk oversized text at char boundaries.
                 let mut start = 0usize;
                 let mut piece = 0usize;
                 while start < text.len() {
@@ -525,7 +429,6 @@ pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
                     while end < text.len() && !text.is_char_boundary(end) {
                         end -= 1;
                     }
-                    // Guard: ensure forward progress on pathological boundaries.
                     if end <= start {
                         end = text.len();
                     }
@@ -548,7 +451,6 @@ pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
     chunks
 }
 
-/// Render-time inverse of splitting: concatenate continuation entries' parts in list order.
 pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
     entries.into_iter().flatten().collect()
 }
@@ -719,14 +621,11 @@ mod tests {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
     }
 
-    // ── Bounded tool-output summary ─────────────────────────────────────────
-
     #[test]
     fn summarize_inlines_small_outputs_and_marks_big_cuts() {
         assert_eq!(summarize_tool_output(""), None);
         assert_eq!(summarize_tool_output("  \n\t\n"), None);
         assert_eq!(summarize_tool_output("one line"), Some("one line".into()));
-        // Small multi-line outputs ride whole — no summary, no "…".
         assert_eq!(
             summarize_tool_output("\n\nfirst real\nsecond"),
             Some("first real\nsecond".into())
@@ -735,22 +634,17 @@ mod tests {
             summarize_tool_output("only line\n\n  \n"),
             Some("only line".into())
         );
-        // Markdown fences are transport wrapping, never content: stripped
-        // even when they'd otherwise be the first line, and a fence-only
-        // output is blank.
         assert_eq!(
             summarize_tool_output("```console\nreal content\n```"),
             Some("real content".into())
         );
         assert_eq!(summarize_tool_output("```\n```"), None);
-        // Big outputs: first non-empty (post-fence) line + unconditional "…".
         let big = format!("```console\nhead line\n{}\n```", "x".repeat(300));
         assert_eq!(summarize_tool_output(&big), Some("head line…".into()));
         let long = "x".repeat(TOOL_OUTPUT_SUMMARY_MAX + 40);
         let summary = summarize_tool_output(&long).unwrap();
         assert_eq!(summary.chars().count(), TOOL_OUTPUT_SUMMARY_MAX + 1);
         assert!(summary.ends_with('…'));
-        // Char-boundary safety on multibyte input.
         let wide = "é".repeat(TOOL_OUTPUT_SUMMARY_MAX + 5);
         let summary = summarize_tool_output(&wide).unwrap();
         assert_eq!(summary.chars().count(), TOOL_OUTPUT_SUMMARY_MAX + 1);
@@ -764,9 +658,8 @@ mod tests {
             new_text: "a\nB\nc\nd\n".into(),
         });
         assert_eq!(stat.path, "/w/a.rs");
-        assert_eq!(stat.additions, 2); // B + d
-        assert_eq!(stat.deletions, 1); // b
-        // New file: every line is an addition.
+        assert_eq!(stat.additions, 2);
+        assert_eq!(stat.deletions, 1);
         let stat = diff_stat(&ToolDiff {
             path: "/w/new.rs".into(),
             old_text: None,
@@ -787,7 +680,7 @@ mod tests {
                 },
             },
         );
-        let full = "running 42 tests\n".repeat(300); // ~5KB, was 4KB inline pre-strip
+        let full = "running 42 tests\n".repeat(300);
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::ToolResult {
@@ -809,8 +702,6 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: outputs never enter the doc at all
-                // (journal-only); diff text neither — stats survive.
                 assert_eq!(output.as_deref(), None);
                 assert_eq!(*output_bytes, None);
                 assert!(diff.is_none(), "inline diff text must not enter the doc");
@@ -834,7 +725,6 @@ mod tests {
                 },
             },
         );
-        // Unresolved: no refs yet.
         apply_sidecar_refs("chat-9", &mut parts);
         assert!(matches!(
             &parts[0],
@@ -858,16 +748,13 @@ mod tests {
             },
         );
         apply_sidecar_refs("chat-9", &mut parts);
-        apply_sidecar_refs("chat-9", &mut parts); // idempotent
+        apply_sidecar_refs("chat-9", &mut parts);
         match &parts[0] {
             MessagePart::Tool {
                 output_ref,
                 diff_ref,
                 ..
             } => {
-                // One-liner fold: outputs never reach the doc, so there is
-                // no output content to key even after resolution; diff
-                // STATS exist, so the diff ref still stamps.
                 assert_eq!(output_ref.as_deref(), None);
                 assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
             }
@@ -889,8 +776,6 @@ mod tests {
                 },
             },
         );
-        // Tagged traffic marks the chip running — and ONLY that: the tail
-        // stays untouched (per-delta chip rewrites polluted the parent doc).
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::Subagent {
@@ -911,7 +796,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // A tagged Done is terminal; later traffic must not regress it.
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::Subagent {
@@ -939,7 +823,6 @@ mod tests {
             } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
             other => panic!("{other:?}"),
         }
-        // Content never leaked into the parent parts.
         assert_eq!(parts.len(), 1);
     }
 

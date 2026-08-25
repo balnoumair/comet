@@ -1,16 +1,3 @@
-//! Live probe: drive the real opencode CLI through AcpHarness and print the
-//! event stream, verifying task-chip correlation + the sidecar-bus-tailed
-//! subagent transcript end-to-end. Needs `opencode` on PATH (or
-//! OPENCODE_EXECUTABLE) with a model provider configured in the target cwd —
-//! the rig recipe uses a mock OpenAI-compatible provider in the workspace's
-//! opencode.json, so no real login is required:
-//!
-//!     cargo run -p zeron-harness --example opencode_subagent_probe -- /tmp/oc-probe/workspace
-//!
-//! Prompt content is irrelevant with the mock provider (it scripts a task
-//! spawn on the first parent round); against a real provider, ask for one
-//! `task` explicitly.
-
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls};
@@ -39,8 +26,6 @@ async fn main() {
         steering,
         interrupt: CancellationToken::new(),
     };
-    // Optional second arg overrides the prompt (e.g. the mock rig's
-    // "TWO subagents" variant exercising concurrent binding).
     let prompt = std::env::args().nth(2).unwrap_or_else(|| {
         "Use the task tool to launch ONE general subagent with description \
          'Viz probe' and prompt: 'Run `echo viz-probe-ok`, then reply with the \
@@ -63,12 +48,9 @@ async fn main() {
         .run(request, controls)
         .await
         .expect("run starts");
-    // stderr is unbuffered; a SIGTERM'd run still shows everything.
     let mut tagged = 0u32;
     let mut parent_done = false;
     loop {
-        // The session stays alive for the steering mailbox after the parent
-        // turn settles — bound the wait for the subagent's tagged Done.
         let ev = match tokio::time::timeout(std::time::Duration::from_secs(90), stream.next()).await
         {
             Ok(Some(ev)) => ev,

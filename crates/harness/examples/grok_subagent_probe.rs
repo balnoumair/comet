@@ -1,9 +1,3 @@
-//! Live probe: drive the real grok CLI through AcpHarness and print the
-//! event stream, verifying subagent spawn correlation + the disk-tailed
-//! transcript end-to-end. Needs a logged-in `grok` on PATH.
-//!
-//!     cargo run -p zeron-harness --example grok_subagent_probe -- /tmp/probe-dir
-
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls};
@@ -52,12 +46,9 @@ async fn main() {
         .run(request, controls)
         .await
         .expect("run starts");
-    // stderr is unbuffered; a SIGTERM'd run still shows everything.
     let mut tagged = 0u32;
     let mut parent_done = false;
     loop {
-        // After the parent turn settles the session stays alive for the
-        // steering mailbox — bound the wait for the subagent's tagged Done.
         let ev = match tokio::time::timeout(std::time::Duration::from_secs(90), stream.next()).await
         {
             Ok(Some(ev)) => ev,

@@ -1,13 +1,6 @@
-//! Claude CLI stream-json wire frames (stdout JSONL + stdin lines).
-//!
-//! Tolerant by construction: every field defaults, unknown frame types map to
-//! [`Frame::Other`], so a newer CLI never breaks parsing — we only read the
-//! fields the normalizer needs (spec: docs/research/harness.md).
-
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// One parsed stdout line.
 #[derive(Debug)]
 pub(crate) enum Frame {
     System(SystemFrame),
@@ -17,7 +10,6 @@ pub(crate) enum Frame {
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
-    /// control_response / control_cancel_request / anything unknown.
     Other,
 }
 
@@ -33,12 +25,8 @@ pub(crate) struct SystemFrame {
     pub cwd: String,
     #[serde(default)]
     pub session_id: String,
-    /// `task_notification` (a background subagent settling): the spawning
-    /// Agent tool's id — the only TAGGED terminal signal the 2.1.x wire has
-    /// for a background subagent (its frames otherwise just stop).
     #[serde(default, alias = "toolUseId")]
     pub tool_use_id: Option<String>,
-    /// `task_notification` terminal status (`completed`/`failed`/`killed`…).
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -69,21 +57,18 @@ pub(crate) struct Delta {
     pub thinking: String,
 }
 
-/// An `assistant` or `user` frame (an Anthropic API message envelope).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageFrame {
     #[serde(default)]
     pub parent_tool_use_id: Option<String>,
     #[serde(default)]
     pub message: MessageBody,
-    /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
-    /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
 }
@@ -153,7 +138,6 @@ pub(crate) struct UsageBody {
     pub output_tokens: u64,
 }
 
-/// A CLI→client control request (`can_use_tool` is the one we act on).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ControlRequestFrame {
     #[serde(default)]
@@ -172,7 +156,6 @@ pub(crate) struct ControlRequestBody {
     pub input: Value,
 }
 
-/// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.
 pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     let value: Value = serde_json::from_str(line)?;
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -189,8 +172,6 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     Ok(frame)
 }
 
-/// A stdin user turn: `{"type":"user","message":{...},"parent_tool_use_id":null}`.
-/// Steering = another such line mid-run (consumed at a step boundary).
 pub(crate) fn user_message_line(text: &str) -> String {
     json!({
         "type": "user",
@@ -200,18 +181,11 @@ pub(crate) fn user_message_line(text: &str) -> String {
     .to_string()
 }
 
-/// One inline image for a stdin user turn (Anthropic base64 image source).
 pub(crate) struct ImageBlock {
-    /// One of the API-supported media types (png/jpeg/gif/webp).
     pub media_type: String,
-    /// Raw base64 (no data-URL prefix).
     pub data: String,
 }
 
-/// A stdin user turn whose content is an array of blocks: the attached images
-/// first, then the text — the standard Anthropic image+text message shape
-/// (verified against the real CLI: `--input-format stream-json` accepts image
-/// content blocks in user frames). Empty `images` degrades to the plain line.
 pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -> String {
     if images.is_empty() {
         return user_message_line(text);
@@ -238,7 +212,6 @@ pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -
     .to_string()
 }
 
-/// Success reply to a CLI control request (`can_use_tool` allow/deny payloads).
 pub(crate) fn control_response_line(request_id: &str, response: Value) -> String {
     json!({
         "type": "control_response",
@@ -251,12 +224,10 @@ pub(crate) fn control_response_line(request_id: &str, response: Value) -> String
     .to_string()
 }
 
-/// `can_use_tool` allow payload with the (possibly updated) tool input.
 pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
-/// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({
         "type": "control_request",
@@ -315,7 +286,6 @@ mod tests {
         assert_eq!(content[0]["source"]["data"], "QUJD");
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "what is this?");
-        // No images ⇒ identical to the plain string line.
         assert_eq!(
             user_message_line_with_images("hi", &[]),
             user_message_line("hi")

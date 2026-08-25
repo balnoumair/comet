@@ -1,12 +1,3 @@
-//! The zeronsh/comet#95 condition, reproduced: npm dying silently with an
-//! errno-encoded exit (254 = ENOENT — npm/cli#4838) during the adapter
-//! fallback. The old `npx -y` path surfaced this as "harness protocol error:
-//! initialize: app-server exited before responding; Codex exited unexpectedly
-//! (exit code 254)" with nothing actionable. The managed install must instead
-//! fail the run with the decoded errno and a recovery hint.
-//!
-//! Single-test binary: it mutates PATH/SHELL/ZERON_* env process-wide.
-
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -21,12 +12,10 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    // npm as issue #95 saw it: dies with 254 and says nothing.
     let npm = bin.join("npm");
     std::fs::write(&npm, "#!/bin/sh\nexit 254\n").unwrap();
     std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
         std::env::set_var("ZERON_ADAPTERS_DIR", dir.path().join("adapters"));
         std::env::set_var("ZERON_NO_LOGIN_SHELL", "1");

@@ -1,13 +1,3 @@
-//! Workspace registry — the row-table sidebar document persisted by the local
-//! engine.
-//!
-//! [`RegistryDoc`] stores materialized rows plus an HLC clock for deterministic
-//! local writes. The existing overlay representation keeps mutations
-//! idempotent while a document is being rebuilt or saved.
-//!
-//! The merge function [`apply_op`] is the local registry implementation. The
-//! typed API mirrors the `WorkspaceDoc` surface used by `WorkspaceHost`.
-
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
@@ -19,25 +9,17 @@ use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 use crate::schema::DocError;
 use crate::workspace::{DeletedSpace, WorkspaceState};
 
-/// Row kinds — the four sidebar tables.
 pub const KIND_DEVICES: &str = "devices";
 pub const KIND_SPACES: &str = "spaces";
 pub const KIND_CHATS: &str = "chats";
 pub const KIND_SESSIONS: &str = "sessions";
 
-/// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
 
-// ── HLC ─────────────────────────────────────────────────────────────────────
-
-/// Encode an HLC string: `{ms:013}-{counter:06}-{device}`. Fixed-width zero
-/// padding makes lexicographic order = (ms, counter, device) order, and the
-/// device suffix makes the order total (two writers can never tie).
 pub fn encode_hlc(ms: i64, counter: u32, device: &str) -> String {
     format!("{ms:013}-{counter:06}-{device}")
 }
 
-/// `a` strictly newer than `b` (`None` = never written, loses to any).
 fn hlc_newer(a: &str, b: Option<&str>) -> bool {
     match b {
         None => true,
@@ -45,8 +27,6 @@ fn hlc_newer(a: &str, b: Option<&str>) -> bool {
     }
 }
 
-/// Monotonic HLC source: never emits the same or an earlier clock twice, even
-/// across a wall-clock regression or restart (state persists with the doc).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HlcClock {
     last_ms: i64,
@@ -69,24 +49,19 @@ impl HlcClock {
     }
 }
 
-// ── rows and ops ────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryRow {
     pub kind: String,
     pub id: String,
-    /// Server seq of the batch that last touched this row (0 locally).
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
     pub deleted: bool,
-    /// Tombstone clock — an upsert newer than this revives the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub del_hlc: Option<String>,
     #[serde(default)]
     pub fields: BTreeMap<String, Value>,
-    /// Per-field last-write clocks.
     #[serde(default)]
     pub clocks: BTreeMap<String, String>,
 }
@@ -104,7 +79,6 @@ impl RegistryRow {
         }
     }
 
-    /// The newest clock anywhere on the row (delete-vs-live comparison base).
     fn max_clock(&self) -> Option<&str> {
         let mut max = self.del_hlc.as_deref();
         for clock in self.clocks.values() {
@@ -119,11 +93,8 @@ impl RegistryRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpKind {
-    /// Creates, and revives tombstones when newer.
     Upsert,
-    /// Never creates or revives ("never invent rows").
     Update,
-    /// Tombstones when causally newer than the row.
     Delete,
 }
 
@@ -133,14 +104,9 @@ pub struct RowOp {
     pub kind: String,
     pub id: String,
     pub op: OpKind,
-    /// Field writes; `Value::Null` deletes the field (still a clocked write).
-    /// Absent for deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<BTreeMap<String, Value>>,
-    /// Clock for every write in `set` without an entry in `clocks`.
     pub hlc: String,
-    /// Per-field clock overrides — re-seed pushes carry a row's ORIGINAL
-    /// clocks so recovery never coarsens causality.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clocks: Option<BTreeMap<String, String>>,
 }
@@ -154,13 +120,9 @@ impl RowOp {
     }
 }
 
-/// Apply one op to a row — the 1:1 mirror of `applyOp` in
-/// `edge/src/registry-core.ts`. Returns the new row (`None` only for an
-/// `update` on a missing row) and whether anything changed.
 pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, bool) {
     if op.op == OpKind::Delete {
         return match row {
-            // Tombstone-on-missing guards against a late create racing the delete.
             None => (
                 Some(RegistryRow::tombstone(&op.kind, &op.id, op.hlc.clone())),
                 true,
@@ -204,8 +166,6 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
             if op.op == OpKind::Update || !hlc_newer(&op.hlc, row.del_hlc.as_deref()) {
                 return (Some(row.clone()), false);
             }
-            // Revival: the tombstone loses wholesale; the upsert's fields are
-            // the row.
             RegistryRow {
                 kind: row.kind.clone(),
                 id: row.id.clone(),
@@ -243,8 +203,6 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
     }
 }
 
-/// A row as a re-seed op (server-behind-client recovery): one upsert carrying
-/// the row's ORIGINAL per-field clocks, or a delete for tombstones.
 pub fn row_to_seed_op(row: &RegistryRow) -> RowOp {
     if row.deleted {
         return RowOp {
@@ -277,31 +235,19 @@ pub fn row_to_seed_op(row: &RegistryRow) -> RowOp {
     }
 }
 
-// ── pending batches ─────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingBatch {
     pub batch: String,
     pub ops: Vec<RowOp>,
-    /// True while the batch is in flight on the CURRENT connection (cleared
-    /// on disconnect so reconnects re-push). Not persisted meaningfully — a
-    /// restart implies a fresh connection.
     #[serde(default, skip_serializing)]
     pub in_flight: bool,
 }
 
-// ── the doc ─────────────────────────────────────────────────────────────────
-
-/// What [`RegistryDoc::apply_state`] decided about a `state` frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOutcome {
-    /// Delta applied over existing authoritative rows.
     Delta,
-    /// Full state replaced local authoritative rows.
     Replaced,
-    /// The server is BEHIND this client (wiped/reset storage): local rows were
-    /// kept and a re-seed batch was enqueued. The caller must push pending.
     Reseeded,
 }
 
@@ -317,18 +263,13 @@ struct PersistedState {
     pending: Vec<PendingBatch>,
 }
 
-/// The local registry replica. Pure data — no I/O, no async; the transport
-/// (`zeron_sync::RegistryClient`) and the engine host drive it under a lock.
 pub struct RegistryDoc {
     device_id: String,
-    /// kind → id → row (server truth).
     authoritative: HashMap<String, HashMap<String, RegistryRow>>,
     server_seq: u64,
     gc_floor: u64,
     clock: HlcClock,
     pending: Vec<PendingBatch>,
-    /// Bumped on every mutation (local or applied) — the engine host converts
-    /// this into watch-channel publishes and snapshot debounces.
     generation: u64,
 }
 
@@ -349,12 +290,10 @@ impl RegistryDoc {
         &self.device_id
     }
 
-    /// Sync cursor: the last server seq this replica has fully applied.
     pub fn cursor(&self) -> u64 {
         self.server_seq
     }
 
-    /// Monotonic local change counter (any mutation bumps it).
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -362,8 +301,6 @@ impl RegistryDoc {
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
-
-    // ── persistence ─────────────────────────────────────────────────────────
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, DocError> {
         let rows = self
@@ -405,9 +342,6 @@ impl RegistryDoc {
         Ok(doc)
     }
 
-    // ── server frames ───────────────────────────────────────────────────────
-
-    /// Apply a hello `state` frame. See [`StateOutcome`] for the three shapes.
     pub fn apply_state(
         &mut self,
         seq: u64,
@@ -425,8 +359,6 @@ impl RegistryDoc {
             return StateOutcome::Delta;
         }
         if seq < self.server_seq {
-            // The server lost state (reset/wipe). Local rows are the only
-            // copy: keep them and re-seed the server with ORIGINAL clocks.
             let seed: Vec<RowOp> = self
                 .authoritative
                 .values()
@@ -443,8 +375,6 @@ impl RegistryDoc {
             }
             return StateOutcome::Reseeded;
         }
-        // Full replace — but local-only rows the server never saw (e.g. it
-        // GC-jumped our cursor while we held unseeded rows) re-seed too.
         let mut incoming: HashMap<String, HashMap<String, RegistryRow>> = HashMap::new();
         for row in rows {
             incoming
@@ -471,7 +401,6 @@ impl RegistryDoc {
         }
     }
 
-    /// Apply a `rows` broadcast (merged truth for the touched rows).
     pub fn apply_rows(&mut self, seq: u64, rows: Vec<RegistryRow>) {
         self.generation += 1;
         for row in rows {
@@ -482,7 +411,6 @@ impl RegistryDoc {
         }
     }
 
-    /// Retire an acked batch; returns whether it existed.
     pub fn ack_batch(&mut self, batch: &str, seq: u64) -> bool {
         let before = self.pending.len();
         self.pending.retain(|b| b.batch != batch);
@@ -497,7 +425,6 @@ impl RegistryDoc {
         }
     }
 
-    /// Batches to push: everything not already in flight on this connection.
     pub fn take_pushable(&mut self) -> Vec<PendingBatch> {
         let mut out = Vec::new();
         for batch in &mut self.pending {
@@ -509,7 +436,6 @@ impl RegistryDoc {
         out
     }
 
-    /// Connection dropped: everything unacked becomes pushable again.
     pub fn mark_disconnected(&mut self) {
         for batch in &mut self.pending {
             batch.in_flight = false;
@@ -522,8 +448,6 @@ impl RegistryDoc {
             .or_default()
             .insert(row.id.clone(), row);
     }
-
-    // ── local writes ────────────────────────────────────────────────────────
 
     fn now_ms() -> i64 {
         Utc::now().timestamp_millis()
@@ -538,14 +462,6 @@ impl RegistryDoc {
         if ops.is_empty() {
             return;
         }
-        // The registry room rejects any batch over its op cap (500), and a
-        // rejected batch is a PERMANENT wedge: error frames carry no batch
-        // id, so the client can never retire it — it replays and fails on
-        // every reconnect, and every write queued behind it (session-status
-        // rows included) never propagates again. `delete_space` on a
-        // ≥250-chat space minted exactly such a batch. Chunk here so no
-        // writer can ever produce one; chunks apply in order, each
-        // atomically (only cross-chunk atomicity is given up).
         const MAX_OPS_PER_BATCH: usize = 400;
         self.generation += 1;
         while !ops.is_empty() {
@@ -554,8 +470,6 @@ impl RegistryDoc {
             } else {
                 Vec::new()
             };
-            // Batch ids only need device-lifetime uniqueness; the HLC of a
-            // fresh tick provides exactly that without a rng dependency.
             let batch = format!("b-{}", self.next_hlc());
             self.pending.push(PendingBatch {
                 batch,
@@ -594,9 +508,6 @@ impl RegistryDoc {
         self.enqueue_ops(ops);
     }
 
-    // ── overlay reads ───────────────────────────────────────────────────────
-
-    /// The row as this device should display it: authoritative + pending ops.
     fn overlay_row(&self, kind: &str, id: &str) -> Option<RegistryRow> {
         let mut row = self
             .authoritative
@@ -616,7 +527,6 @@ impl RegistryDoc {
         row.filter(|r| !r.deleted)
     }
 
-    /// All live rows of `kind`, overlay applied.
     fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
         let mut ids: Vec<String> = self
             .authoritative
@@ -653,9 +563,6 @@ impl RegistryDoc {
         self.overlay_row(kind, id).is_some()
     }
 
-    // ── typed API (the WorkspaceDoc surface) ────────────────────────────────
-
-    /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
         let set = fields([
             ("id", json!(device.id)),
@@ -669,7 +576,6 @@ impl RegistryDoc {
         Ok(())
     }
 
-    /// LWW rename (settings UI; any device may write). `false` when no such row.
     pub fn rename_device(&mut self, device_id: &str, name: &str) -> Result<bool, DocError> {
         if !self.row_exists(KIND_DEVICES, device_id) {
             return Ok(false);
@@ -683,8 +589,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Stamp `lastSeenAt` on an existing device row (boot/shutdown only —
-    /// periodic liveness rides presence frames, never rows).
     pub fn set_device_last_seen(
         &mut self,
         device_id: &str,
@@ -711,8 +615,6 @@ impl RegistryDoc {
         devices.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(devices)
     }
-
-    // ── spaces ──────────────────────────────────────────────────────────────
 
     pub fn upsert_space(&mut self, space: &Space) -> Result<(), DocError> {
         let set = fields([
@@ -746,8 +648,6 @@ impl RegistryDoc {
         Ok(spaces)
     }
 
-    /// LWW display-name set from any device; `None` clears back to the derived
-    /// name (basename of path). `false` when no such row.
     pub fn rename_space(&mut self, space_id: &str, name: Option<&str>) -> Result<bool, DocError> {
         if !self.row_exists(KIND_SPACES, space_id) {
             return Ok(false);
@@ -761,8 +661,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Owner-stamped git presence for the space folder (ownership is asserted
-    /// by the engine layer, this is mechanism only).
     pub fn set_space_git(
         &mut self,
         space_id: &str,
@@ -786,10 +684,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Hard-delete a space and cascade to its chats: one batch tombstones the
-    /// space row and every chat/session row whose `spaceId` matches — the
-    /// server applies the batch atomically. Returns the removed chat ids so
-    /// the engine can drop local state.
     pub fn delete_space(&mut self, space_id: &str) -> Result<DeletedSpace, DocError> {
         let existed = self.row_exists(KIND_SPACES, space_id);
         let chat_ids: Vec<String> = self
@@ -807,8 +701,6 @@ impl RegistryDoc {
         self.delete_row_ops(&keys);
         Ok(DeletedSpace { existed, chat_ids })
     }
-
-    // ── chats ───────────────────────────────────────────────────────────────
 
     pub fn upsert_chat(&mut self, chat: &Chat) -> Result<(), DocError> {
         let config = match &chat.config {
@@ -845,11 +737,6 @@ impl RegistryDoc {
         Ok(())
     }
 
-    /// Claim-on-first-command row: ONLY the fields the claim actually knows
-    /// (identity, cwd, space). Absent fields carry no clocked write, so the
-    /// real `createChat` upsert — racing behind on the registry channel with
-    /// older clocks — still lands its `config`/`title` under per-field LWW
-    /// instead of losing them to `Null` deletes.
     pub fn claim_chat(
         &mut self,
         chat_id: &str,
@@ -871,8 +758,6 @@ impl RegistryDoc {
         self.write(KIND_CHATS, chat_id, OpKind::Upsert, set);
     }
 
-    /// Synced seen marker (LWW) with a monotonic guard: no write when the
-    /// stored stamp is already >= `at`.
     pub fn set_chat_seen(&mut self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
         let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
             return Ok(false);
@@ -946,9 +831,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Retarget the chat onto another folder — the mid-session "switch to an
-    /// existing worktree" move. Harness resume is cwd-scoped, so the next run
-    /// in the new folder starts a fresh harness conversation by design.
     pub fn set_chat_cwd(&mut self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
@@ -997,8 +879,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Host-side resume continuity. An empty `session_id` is the explicit
-    /// "do not resume" tombstone written after a harness rejects a resume.
     pub fn set_chat_harness_session(
         &mut self,
         chat_id: &str,
@@ -1020,7 +900,6 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Host-side sidebar freshness: preview + timestamp of the latest message.
     pub fn set_chat_last_message(
         &mut self,
         chat_id: &str,
@@ -1042,18 +921,12 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Tombstone: delete the chat row (and its session-status row). The
-    /// per-chat session doc remains — this removes the index entry only.
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {
         let existed = self.row_exists(KIND_CHATS, chat_id);
         self.delete_row_ops(&[(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)]);
         Ok(existed)
     }
 
-    // ── sessions ────────────────────────────────────────────────────────────
-
-    /// Upsert a session-status row (writer discipline: each device writes only
-    /// its own runs' rows). Staleness is checked client-side via `updatedAt`.
     pub fn upsert_session(&mut self, session: &Session) -> Result<(), DocError> {
         let set = fields([
             ("chatId", json!(session.chat_id)),
@@ -1076,8 +949,6 @@ impl RegistryDoc {
         Ok(sessions)
     }
 
-    // ── whole-doc read ──────────────────────────────────────────────────────
-
     pub fn read_all(&self) -> Result<WorkspaceState, DocError> {
         Ok(WorkspaceState {
             devices: self.read_devices()?,
@@ -1087,14 +958,6 @@ impl RegistryDoc {
         })
     }
 
-    // ── migration ───────────────────────────────────────────────────────────
-
-    /// Seed from the legacy Loro workspace doc's materialized state (first
-    /// boot after the update). Every row becomes a pending upsert whose HLC
-    /// derives from the row's own newest timestamp — historical, so any
-    /// genuinely newer live write beats the migrated value; identical across
-    /// devices, so N devices seeding the same converged doc is idempotent
-    /// (equal values, deterministic device tie-break).
     pub fn seed_from_workspace(&mut self, state: &WorkspaceState) -> Result<usize, DocError> {
         let mut ops: Vec<RowOp> = Vec::new();
         let mut seed = |kind: &str, id: &str, ms: i64, set: BTreeMap<String, Value>| {
@@ -1199,15 +1062,12 @@ impl RegistryDoc {
             );
         }
         let count = ops.len();
-        // Chunk so a huge legacy workspace never exceeds the server's batch cap.
         for chunk in ops.chunks(400) {
             self.enqueue_ops(chunk.to_vec());
         }
         Ok(count)
     }
 }
-
-// ── field helpers ───────────────────────────────────────────────────────────
 
 fn fields<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value> {
     entries
@@ -1249,10 +1109,6 @@ fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
         }
     }
 }
-
-// SessionStatus needs to serialize to the same strings the loro doc used
-// ("idle"/"working"/…) — zeron_proto's serde derives already use camelCase;
-// the compile-time check lives in the tests below.
 
 #[cfg(test)]
 mod tests;

@@ -1,9 +1,3 @@
-//! Local workspace registry and its watch channels.
-//!
-//! The registry remains useful in local mode: it indexes spaces, chats,
-//! devices, and live session status in one persisted snapshot. It is no longer
-//! a network document and has no presence, room, or remote-device behavior.
-
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
@@ -109,7 +103,6 @@ impl WorkspaceHost {
         &self.inner.config.device_id
     }
 
-    /// Local persistence is always available once the host has opened.
     pub fn connected(&self) -> bool {
         true
     }

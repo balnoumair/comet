@@ -1,13 +1,3 @@
-//! zeron-doc — session & workspace Loro doc schemas and the typed mirror layer.
-//!
-//! The schema shape (container names, part maps with LoroText bodies, and
-//! command entries) is stable so local snapshots remain readable across
-//! engine restarts.
-//!
-//! Load-bearing invariant (measured in zeron, `oplog-shape.test.ts`): message parts are a
-//! LoroList of part maps whose text bodies live in **LoroText** — streaming appends RLE-merge at
-//! ~1.03x oplog overhead, whereas rewriting whole part values costs ~125x.
-
 pub mod commands;
 pub mod constants;
 pub mod parts;

@@ -1,21 +1,3 @@
-//! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of zeron's
-//! `generateTitle` in `sessions.ts`).
-//!
-//! Flow (fire-and-forget from the run task; every failure is a silent skip with
-//! tracing — a title must never fail or delay a run):
-//! 1. skip when the chat already has a title (or has no workspace row);
-//! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
-//!    last listed model — zeron's `cheapestModel`);
-//! 3. run a one-shot, non-streaming-collected titling prompt through the
-//!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on zeron's short backoff ladder; fall back to the prompt's first
-//!    words when every attempt produces nothing;
-//! 4. re-check the title (a user rename during generation wins);
-//! 5. when the chat sits in a zeron worktree (`zeron/<name>` branch), rename the
-//!    branch from the title and update the chat's branch row;
-//! 6. `rename_chat` in the workspace doc.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -32,12 +14,8 @@ use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
-/// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (zeron's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
-/// `git branch -m` can lose a lock race against DiffSync's concurrent git
-/// reads; a short retry usually clears it.
 const RENAME_RETRY_DELAYS_MS: &[u64] = &[50, 150, 400];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -48,10 +26,6 @@ struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
-    /// Chats with a titling task already running — dispatch-time and Done-time
-    /// `maybe_generate` used to race: the loser could `rename_chat` after a
-    /// failed branch rename and leave `chat.branch` on the original
-    /// `zeron/<name>` while the title was already set.
     inflight: Mutex<HashSet<String>>,
 }
 
@@ -72,8 +46,6 @@ impl TitleGenerator {
         }
     }
 
-    /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
-    /// task after a completed exchange; runs detached so it never delays anything.
     pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
         let this = self.clone();
         let chat_id = chat_id.to_string();
@@ -94,7 +66,7 @@ impl TitleGenerator {
         cwd: &str,
     ) -> Result<(), EngineError> {
         if !lock(&self.inner.inflight).insert(chat_id.to_string()) {
-            return Ok(()); // another titling task owns this chat
+            return Ok(());
         }
         let result = self.generate_locked(chat_id, harness_id, prompt, cwd).await;
         lock(&self.inner.inflight).remove(chat_id);
@@ -114,11 +86,10 @@ impl TitleGenerator {
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
         if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-            return Ok(()); // already named
+            return Ok(());
         }
 
         let generated = self.run_title_model(harness_id, prompt, cwd).await;
-        // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
             .take(7)
@@ -132,8 +103,6 @@ impl TitleGenerator {
             return Ok(());
         }
 
-        // Re-read after the model call: a user may have named the chat or checked
-        // out another branch while the throwaway generation was live.
         let latest = self.inner.workspace.chat(chat_id)?.unwrap_or(chat);
         if latest
             .title
@@ -143,8 +112,6 @@ impl TitleGenerator {
             return Ok(());
         }
 
-        // Rename the worktree branch when the chat still sits on its original
-        // zeron/<name> branch (guards live inside rename_worktree_branch).
         if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
             && branch.starts_with("zeron/")
         {
@@ -157,8 +124,7 @@ impl TitleGenerator {
                     .await
                 {
                     Ok(renamed) if &renamed != branch => {
-                        if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed)
-                        {
+                        if let Err(err) = self.inner.workspace.set_chat_branch(chat_id, &renamed) {
                             tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
                         }
                         break;
@@ -184,7 +150,6 @@ impl TitleGenerator {
         Ok(())
     }
 
-    /// One-shot titling run: collect TextDeltas until Done; retries on failure.
     async fn run_title_model(
         &self,
         harness_id: HarnessId,
@@ -236,9 +201,6 @@ impl TitleGenerator {
     }
 }
 
-/// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
-/// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
-/// listed model; `None` when the catalog is empty (harness picks its default).
 fn cheapest_model(models: &[Model]) -> Option<String> {
     if models.is_empty() {
         return None;
@@ -252,7 +214,6 @@ fn cheapest_model(models: &[Model]) -> Option<String> {
     small.or(models.last()).map(|m| m.id.clone())
 }
 
-/// First line, stripped of quote/heading dressing, capped at 60 chars.
 fn clean_title(raw: &str) -> String {
     let first = raw.trim().lines().next().unwrap_or("");
     first
@@ -263,8 +224,6 @@ fn clean_title(raw: &str) -> String {
         .collect()
 }
 
-/// Drive one titling run through the harness: no steering, questions resolved
-/// empty immediately (a titling prompt must never block on input).
 async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     request: RunRequest,
@@ -299,7 +258,7 @@ async fn collect_text(
             _ => {}
         }
     }
-    drop(steer_tx); // keep the mailbox open for the run's whole lifetime
+    drop(steer_tx);
     Ok(text)
 }
 

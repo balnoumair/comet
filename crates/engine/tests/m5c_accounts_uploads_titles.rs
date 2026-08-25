@@ -1,10 +1,3 @@
-//! M5c integration: agent-account slot mechanics (claude-swap), uploads
-//! chunk→commit→readback + path jail, chat auto-titling with the mock harness,
-//! and the RPC dispatch for each new method over the memory transport.
-//!
-//! Account tests use explicit `AgentAccountsConfig` paths under a tempdir (never
-//! the real `~/.claude` / `~/.codex`), so they are hermetic and parallel-safe.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,11 +17,6 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-/// AgentAccounts wired to temp claude/codex homes.
 fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
     let config = AgentAccountsConfig {
         data_dir: root.join("data"),
@@ -65,7 +53,6 @@ fn write_claude_login(config: &AgentAccountsConfig, email: &str, uuid: &str, tok
             "claudeAiOauth": {
                 "accessToken": token,
                 "refreshToken": format!("refresh-{token}"),
-                // Far-future expiry: usage probes must never try to rotate it.
                 "expiresAt": 4_102_444_800_000i64,
             }
         })
@@ -74,7 +61,6 @@ fn write_claude_login(config: &AgentAccountsConfig, email: &str, uuid: &str, tok
     .expect("claude creds");
 }
 
-/// An unsigned JWT with the claims codex mines from `id_token`.
 fn fake_id_token(email: &str, account_id: &str, plan: &str) -> String {
     let header = BASE64_URL.encode(br#"{"alg":"none"}"#);
     let payload = BASE64_URL.encode(
@@ -150,7 +136,6 @@ async fn init_repo(dir: &Path) {
     git(dir, &["commit", "-m", "initial"]).await;
 }
 
-/// Poll until `probe` yields Some, or panic at the deadline.
 async fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -165,16 +150,11 @@ async fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agent accounts — claude slot swap round trip
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn claude_slot_swap_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (accounts, config) = test_accounts(tmp.path());
 
-    // Live login = Alice. Listing detects + auto-snapshots her into a slot.
     write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
     let snapshot = accounts.list(false).await.expect("list");
     assert_eq!(
@@ -194,8 +174,6 @@ async fn claude_slot_swap_round_trip() {
     let alice_id = alice.id.clone();
     assert_eq!(alice_id.len(), 16, "slot id is 16 hex chars");
 
-    // Bob logs in via the CLI (live files replaced) — next list snapshots Bob
-    // and shows Alice as a saved, inactive slot.
     write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
     let snapshot = accounts.list(false).await.expect("list bob");
     let mut emails = account_emails(&snapshot, HarnessId::ClaudeCode);
@@ -208,8 +186,6 @@ async fn claude_slot_swap_round_trip() {
         ]
     );
 
-    // Activate Alice: her slot's tokens land in the live files, Bob's live
-    // session is auto-snapshotted first, identity merged into claude.json.
     let snapshot = accounts
         .activate(HarnessId::ClaudeCode, &alice_id)
         .await
@@ -234,13 +210,11 @@ async fn claude_slot_swap_round_trip() {
             .expect("cfg json");
     assert_eq!(cfg["oauthAccount"]["emailAddress"], "alice@example.com");
     assert_eq!(cfg["userID"], "user-uuid-alice");
-    // The rest of the config survived the merge (only identity fields swapped).
     assert!(
         cfg["projects"]["/keep/me"].is_object(),
         "unrelated config keys preserved"
     );
 
-    // Slot files: exactly two, under data/agent-accounts/claude-code.
     let slots_dir = config.data_dir.join("agent-accounts").join("claude-code");
     let slot_count = std::fs::read_dir(&slots_dir)
         .expect("slots dir")
@@ -249,7 +223,6 @@ async fn claude_slot_swap_round_trip() {
         .count();
     assert_eq!(slot_count, 2);
 
-    // Corrupt claude.json → activate must refuse rather than wipe it.
     std::fs::write(&config.claude_config_file, "{ definitely not json").expect("corrupt");
     let bob_id = snapshot
         .accounts
@@ -274,7 +247,6 @@ async fn claude_account_switch_keeps_live_mcp_oauth() {
     let creds_file = config.claude_config_dir.join(".credentials.json");
 
     write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
-    // Alice's first snapshot includes a MCP token that will go stale.
     std::fs::write(
         &creds_file,
         serde_json::json!({
@@ -299,7 +271,6 @@ async fn claude_account_switch_keeps_live_mcp_oauth() {
         .id
         .clone();
 
-    // Bob becomes live; MCP tokens rotate while he is the active login.
     write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
     std::fs::write(
         &creds_file,
@@ -348,7 +319,6 @@ async fn claude_account_switch_keeps_mcp_when_target_slot_has_none() {
     let (accounts, config) = test_accounts(tmp.path());
     let creds_file = config.claude_config_dir.join(".credentials.json");
 
-    // Alice saved via the oauth-only shape (new login / usage refresh).
     write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
     let snapshot = accounts.list(false).await.expect("list alice");
     let alice_id = snapshot.accounts[0].id.clone();
@@ -398,7 +368,6 @@ async fn codex_slot_swap_and_api_key_detection() {
     assert!(carol.active);
     let carol_id = carol.id.clone();
 
-    // Second login (Dave) becomes live; swap back to Carol.
     write_codex_login(&config, "dave@example.com", "acct-dave");
     accounts.list(false).await.expect("list dave");
     let snapshot = accounts
@@ -420,7 +389,6 @@ async fn codex_slot_swap_and_api_key_detection() {
     .expect("auth json");
     assert_eq!(auth["tokens"]["account_id"], "acct-carol");
 
-    // API-key mode: no tokens, just the key.
     std::fs::write(
         config.codex_home.join("auth.json"),
         serde_json::json!({ "OPENAI_API_KEY": "sk-test-12345678abcd" }).to_string(),
@@ -444,7 +412,6 @@ async fn forget_guards_and_removes_slots() {
     let snapshot = accounts.list(false).await.expect("list");
     let alice_id = snapshot.accounts[0].id.clone();
 
-    // Path-shaped ids never reach the filesystem.
     assert!(
         accounts
             .forget(HarnessId::ClaudeCode, "../../evil")
@@ -457,7 +424,6 @@ async fn forget_guards_and_removes_slots() {
             .await
             .is_err()
     );
-    // The live login can't be forgotten (it would just be re-detected).
     assert!(
         accounts
             .forget(HarnessId::ClaudeCode, &alice_id)
@@ -465,7 +431,6 @@ async fn forget_guards_and_removes_slots() {
             .is_err()
     );
 
-    // A non-active slot forgets cleanly.
     write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
     accounts.list(false).await.expect("list bob");
     let snapshot = accounts
@@ -507,8 +472,6 @@ async fn claude_login_flow_is_pkce_paste_code() {
     let mode = serde_json::to_value(start.mode).expect("mode");
     assert_eq!(mode, serde_json::json!("paste-code"));
 
-    // Claude flows poll as pending (paste-code completes them); cancel drops the
-    // flow so the next poll reports it expired.
     let poll = accounts.poll_login(&start.login_id).await.expect("poll");
     assert_eq!(
         serde_json::to_value(poll.status).expect("status"),
@@ -527,18 +490,11 @@ async fn claude_login_flow_is_pkce_paste_code() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Uploads
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn uploads_chunk_commit_readback_and_jail() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uploads = Uploads::new(tmp.path());
 
-    // 100KB of pseudo-random bytes, staged as three positional base64 chunks
-    // (out of order, with one retried) — chunk boundaries are multiples of 3
-    // bytes so independent base64 strings concatenate losslessly.
     let payload: Vec<u8> = (0..100_002u32)
         .map(|i| (i.wrapping_mul(31) % 251) as u8)
         .collect();
@@ -560,7 +516,6 @@ async fn uploads_chunk_commit_readback_and_jail() {
     assert!(path.ends_with("up-1-photo.png"), "path: {path}");
     assert_eq!(std::fs::read(&path).expect("committed file"), payload);
 
-    // Readback: chunked reassembly round-trips.
     let mut assembled = Vec::new();
     let mut offset = 0u64;
     loop {
@@ -575,7 +530,6 @@ async fn uploads_chunk_commit_readback_and_jail() {
     }
     assert_eq!(assembled, payload);
 
-    // Missing chunk → commit fails.
     uploads
         .append("up-2", &chunks[0], Some(0))
         .expect("chunk 0");
@@ -587,8 +541,6 @@ async fn uploads_chunk_commit_readback_and_jail() {
         "hole detected"
     );
 
-    // Path jail: files outside the uploads dir (and outside any allowed cwd
-    // root) are rejected, including traversal attempts and the dir itself.
     let outside = tmp.path().join("outside.png");
     std::fs::write(&outside, b"nope").expect("outside file");
     assert!(
@@ -602,31 +554,22 @@ async fn uploads_chunk_commit_readback_and_jail() {
         uploads.read_chunk(&sneaky, 0, &[]).is_err(),
         "traversal rejected"
     );
-    // …but a workspace-known cwd root admits its files.
     let ok = uploads
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
     assert_eq!(BASE64.decode(&ok.data).expect("data"), b"nope");
-    // Non-image extensions are refused even inside the jail (zeron parity).
     let text = PathBuf::from(uploads.dir()).join("notes.txt");
     std::fs::create_dir_all(uploads.dir()).expect("uploads dir");
     std::fs::write(&text, b"text").expect("txt");
     assert!(uploads.read_chunk(&text.to_string_lossy(), 0, &[]).is_err());
 
-    // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());
     assert!(uploads.commit("unknown-upload", "x.png").is_err());
 }
 
-// ---------------------------------------------------------------------------
-// Titling
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // Worktree root must be inside the tempdir (EngineCore reads the env-less
-    // default otherwise) — create the worktree with a dedicated Repos handle.
     let repo_dir = tmp.path().join("repo");
     init_repo(&repo_dir).await;
     let repos = Repos::with_worktrees_root(
@@ -693,22 +636,14 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .await
         .expect("dispatch");
 
-    // The mock's scripted reply doubles as the titling model's output.
-    // Wait for title *and* branch: titling renames the worktree before
-    // `rename_chat`, so both should land together once generate finishes.
     let chat = wait_for("chat title + branch", || {
-        core.workspace
-            .chat(chat_id)
-            .ok()
-            .flatten()
-            .filter(|c| {
-                c.title.as_deref() == Some("Fix Login Flow")
-                    && c.branch.as_deref() == Some("zeron/fix-login-flow")
-            })
+        core.workspace.chat(chat_id).ok().flatten().filter(|c| {
+            c.title.as_deref() == Some("Fix Login Flow")
+                && c.branch.as_deref() == Some("zeron/fix-login-flow")
+        })
     })
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
-    // Branch renamed from the title, chat row updated to match.
     assert_eq!(chat.branch.as_deref(), Some("zeron/fix-login-flow"));
     let head = tokio::process::Command::new("git")
         .args(["branch", "--show-current"])
@@ -721,7 +656,6 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         "zeron/fix-login-flow"
     );
 
-    // A titled chat is never re-titled: rename, run again, title sticks.
     core.workspace
         .rename_chat(chat_id, "My Custom Name")
         .expect("rename");
@@ -763,30 +697,24 @@ async fn rename_worktree_branch_guards_and_collisions() {
         .expect("worktree");
     let wt_path = Path::new(&wt.path);
 
-    // Guard: expected branch mismatch → no-op, returns the actual branch.
     let unchanged = repos
         .rename_worktree_branch(wt_path, "zeron/not-this-one", "Some Title")
         .await
         .expect("guarded");
     assert_eq!(unchanged, wt.branch);
 
-    // Happy path: renamed to the title slug.
     let renamed = repos
         .rename_worktree_branch(wt_path, &wt.branch, "Add Dark Mode!")
         .await
         .expect("renamed");
     assert_eq!(renamed, "zeron/add-dark-mode");
 
-    // Already renamed → the guard (branch no longer zeron/<folder>) makes any
-    // further title rename a no-op.
     let again = repos
         .rename_worktree_branch(wt_path, "zeron/add-dark-mode", "Different Title")
         .await
         .expect("second rename");
     assert_eq!(again, "zeron/add-dark-mode");
 
-    // Collision: a second worktree whose title slug already exists gets the
-    // stable hash suffix.
     let wt2 = repos
         .create_worktree(&repo_dir, "main")
         .await
@@ -801,7 +729,6 @@ async fn rename_worktree_branch_guards_and_collisions() {
         "suffixed: {renamed2}"
     );
 
-    // Slug edge cases.
     assert_eq!(
         worktree_branch_from_title("  Fix `Login` Flow!  "),
         "zeron/fix-login-flow"
@@ -813,17 +740,12 @@ async fn rename_worktree_branch_guards_and_collisions() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// RPC dispatch
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn rpc_dispatch_for_m5c_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let core = assemble_with_mock(&tmp.path().join("data"), Vec::new());
     let client = zeron_rpc::memory_client(core.rpc_service());
 
-    // Uploads: chunk → commit → readback over the wire.
     let payload = b"fake png bytes".to_vec();
     let ok = client
         .call(
@@ -857,7 +779,6 @@ async fn rpc_dispatch_for_m5c_methods() {
             .expect("base64"),
         payload
     );
-    // Jail holds over RPC too.
     assert!(
         client
             .call(
@@ -868,8 +789,6 @@ async fn rpc_dispatch_for_m5c_methods() {
             .is_err()
     );
 
-    // Agent accounts: snapshot shape (this machine's real CLI state may or may
-    // not include logins — assert the envelope, not the contents).
     let snapshot = client
         .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
         .await
@@ -877,7 +796,6 @@ async fn rpc_dispatch_for_m5c_methods() {
     assert!(snapshot["accounts"].is_array());
     assert!(snapshot["warnings"].is_array());
 
-    // Login lifecycle: start (paste-code) → poll pending → cancel → gone.
     let start = client
         .call(
             methods::START_AGENT_LOGIN,
@@ -920,7 +838,6 @@ async fn rpc_dispatch_for_m5c_methods() {
         "cancelled login is expired"
     );
 
-    // Error paths: junk account ids and dead logins fail cleanly.
     assert!(
         client
             .call(
@@ -982,7 +899,6 @@ async fn cursor_slot_swap_round_trip() {
     let dir = tempfile::tempdir().expect("tmp");
     let (accounts, config) = test_accounts(dir.path());
 
-    // Live SDK login = Erin; listing detects + auto-snapshots her slot.
     write_cursor_login(&config, "erin@example.com", 86_400_000);
     let snapshot = accounts.list(false).await.expect("list");
     assert_eq!(
@@ -998,7 +914,6 @@ async fn cursor_slot_swap_round_trip() {
     .id
     .clone();
 
-    // A second login (Frank) becomes live; both slots exist, Frank active.
     write_cursor_login(&config, "frank@example.com", 86_400_000);
     let snapshot = accounts.list(false).await.expect("list");
     assert_eq!(
@@ -1009,7 +924,6 @@ async fn cursor_slot_swap_round_trip() {
         ]
     );
 
-    // Swap back to Erin: the SDK store file is rewritten from her slot.
     let snapshot = accounts
         .activate(HarnessId::Cursor, &erin_id)
         .await
@@ -1026,7 +940,6 @@ async fn cursor_slot_swap_round_trip() {
             .unwrap();
     assert_eq!(live["email"], "erin@example.com");
 
-    // An expired live key detects (card + slot survive) but warns.
     write_cursor_login(&config, "erin@example.com", -1000);
     let snapshot = accounts.list(false).await.expect("list");
     assert!(
@@ -1044,9 +957,6 @@ async fn cursor_login_flow_spawns_shim_and_auto_activates() {
     let dir = tempfile::tempdir().expect("tmp");
     let (accounts, config) = test_accounts(dir.path());
 
-    // Fake shim: in login mode, emit the auth-url frame, write the minted
-    // store file where the engine pointed us, exit 0. Mirrors the real shim's
-    // `node <shim> login <store-path>` argv contract.
     let shim = dir.path().join("fake-cursor-shim.sh");
     std::fs::write(
         &shim,
@@ -1090,8 +1000,6 @@ exit 0
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // First connect on a device with no live login: the minted key was
-    // auto-activated, so runs work immediately.
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config.cursor_sdk_auth_file).unwrap())
             .unwrap();

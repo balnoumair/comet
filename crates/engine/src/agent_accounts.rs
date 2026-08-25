@@ -1,43 +1,3 @@
-//! AgentAccounts — the Claude Code / Codex / Cursor logins on this device
-//! (feature-inventory §3.7 "Agent accounts"; port of zeron's `agent-accounts.ts`).
-//!
-//! Each provider stores exactly one live login:
-//!
-//! - **Claude Code** — credentials in `~/.claude/.credentials.json`
-//!   (`$CLAUDE_CONFIG_DIR` relocates the dir) or, on macOS, the Keychain item
-//!   `Claude Code-credentials`; the account identity (`oauthAccount`, `userID`)
-//!   lives in `~/.claude.json`.
-//! - **Codex** — `$CODEX_HOME/auth.json` (default `~/.codex`): a ChatGPT OAuth
-//!   token set (identity inside the `id_token` JWT) or a raw API key.
-//! - **Cursor** — `~/.cursor/sdk/auth.json`: the Cursor SDK's credential store
-//!   (`StoredSdkCredentials`) holding the named, expiring user API key its
-//!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
-//!   whole-account session tokens, which zeron never reads.
-//!
-//! Claude-swap mechanics:
-//!
-//! 1. **Detect** the live login of each CLI and auto-snapshot it into a slot
-//!    under `{data_dir}/agent-accounts/{harness}/{slotId}.json` — the current
-//!    session is always backed up before any swap, and refreshed tokens stay
-//!    current.
-//! 2. **Swap** (`activate`): overwrite the CLI's credential store (and, for
-//!    Claude, merge the identity back into `~/.claude.json`) with a saved slot.
-//!    Claude's credential blob is overloaded: `claudeAiOauth` is per-account,
-//!    but sibling keys such as `mcpOAuth` are machine-shared MCP/plugin tokens.
-//!    Activate splices those live shared fields onto the target login so a
-//!    switch does not force every MCP server to re-auth.
-//! 3. **Add** (`start_login`…): drive an OAuth flow for a NEW account without
-//!    touching the live one. Claude uses the public PKCE code flow (paste-code);
-//!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
-//!    until its loopback callback lands.
-//!
-//! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike zeron (fetch on every
-//! list, 60s cache), native only hits the network when `force_usage` is set —
-//! the default list stays offline-fast and deterministic; the UI passes
-//! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
-//! non-forced lists in between.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -58,8 +18,6 @@ use zeron_proto::{
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
-// Claude Code's public OAuth client (the one the CLI itself uses for the manual
-// "paste the code" flow — no secret involved, PKCE carries the proof).
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
 const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference";
@@ -71,9 +29,6 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
-/// Claude Code stores these next to `claudeAiOauth` in the same credential
-/// blob, but they are machine-shared (MCP server OAuth, plugin secrets) and
-/// rotate independently of any account slot. On activate the live copies win.
 const CLAUDE_SHARED_CREDENTIAL_KEYS: &[&str] = &[
     "mcpOAuth",
     "mcpOAuthClientConfig",
@@ -83,31 +38,19 @@ const CLAUDE_SHARED_CREDENTIAL_KEYS: &[&str] = &[
 ];
 
 const USAGE_TTL: Duration = Duration::from_secs(60);
-/// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Filesystem knobs — env-resolved in production ([`AgentAccountsConfig::detect`]),
-/// explicit in tests.
 #[derive(Debug, Clone)]
 pub struct AgentAccountsConfig {
-    /// Engine data dir; slots live under `{data_dir}/agent-accounts/`.
     pub data_dir: PathBuf,
-    /// Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`) — holds `.credentials.json`.
     pub claude_config_dir: PathBuf,
-    /// Claude identity file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`).
     pub claude_config_file: PathBuf,
-    /// Codex home (`$CODEX_HOME` or `~/.codex`) — holds `auth.json`.
     pub codex_home: PathBuf,
-    /// The Cursor SDK's credential store (`~/.cursor/sdk/auth.json`): the
-    /// named, expiring API key minted by its browser login. SEPARATE from
-    /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
 }
 
 impl AgentAccountsConfig {
-    /// Production resolution: `CLAUDE_CONFIG_DIR` relocates both the Claude config
-    /// json and the credentials file; `CODEX_HOME` relocates the Codex auth file.
     pub fn detect(data_dir: &Path) -> Self {
         let env_dir = |name: &str| {
             std::env::var_os(name)
@@ -141,8 +84,6 @@ impl AgentAccountsConfig {
     }
 }
 
-// ── slot storage ────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SlotProfile {
@@ -156,57 +97,40 @@ struct SlotProfile {
     auth_kind: AgentAuthKind,
 }
 
-/// One saved login (`{slotId}.json`), same field surface as zeron's slot files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Slot {
     id: String,
     harness: HarnessId,
-    /// The provider-side identity the slot is keyed by (account uuid/email).
     account_key: String,
     profile: SlotProfile,
-    /// Claude: the `.credentials.json`/Keychain payload. Codex: `auth.json`.
     credentials: serde_json::Value,
-    /// Claude only: `{oauthAccount, userID}` merged into `~/.claude.json` on swap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_config: Option<serde_json::Value>,
     saved_at: i64,
-    /// First time this account was saved — the STABLE sort key, so switching the
-    /// active account (which re-snapshots and bumps `saved_at`) never reorders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<i64>,
 }
 
-/// A live detection result (before it's persisted into a slot).
 #[derive(Debug, Clone)]
 struct Detected {
     account_key: String,
     profile: SlotProfile,
-    /// `None` ⇒ we know a login exists but couldn't read the secret.
     credentials: Option<serde_json::Value>,
     claude_config: Option<serde_json::Value>,
 }
-
-// ── login flows ─────────────────────────────────────────────────────────────
 
 enum LoginFlow {
     Claude {
         verifier: String,
         started_at: Instant,
     },
-    /// A spawned login child polled to completion: `codex login` against a
-    /// throwaway `CODEX_HOME`, or the cursor shim's login mode minting into a
-    /// throwaway store file. Either way the LIVE login is never touched;
-    /// completion is the credential file appearing under `home`.
     Spawned {
         harness: HarnessId,
-        /// The login child; monitored (try_wait) + killable from cancel.
         child: Arc<Mutex<Option<tokio::process::Child>>>,
-        /// Throwaway credential dir, reclaimed on cancel/completion.
         home: PathBuf,
         started_at: Instant,
         output: Arc<Mutex<String>>,
-        /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
     },
 }
@@ -221,15 +145,8 @@ impl LoginFlow {
     }
 }
 
-// ── service ─────────────────────────────────────────────────────────────────
-
-/// Cached usage probe result: the windows (or a remembered miss) + fetch time.
 type CachedUsage = (Option<UsageSnapshot>, Instant);
 
-/// One live usage probe: rate-limit windows plus the plan label the provider
-/// reported alongside them (Codex's usage endpoint carries a live `plan_type`,
-/// which supersedes the login-time JWT claim — plan changes show up here
-/// without a re-login). Claude's usage endpoint has no plan field.
 #[derive(Clone, Default)]
 struct UsageSnapshot {
     windows: Vec<AgentUsageWindow>,
@@ -240,10 +157,7 @@ struct Inner {
     config: AgentAccountsConfig,
     http: reqwest::Client,
     flows: Mutex<HashMap<String, LoginFlow>>,
-    /// `"{harness}:{accountKey}"` → cached usage windows.
     usage_cache: Mutex<HashMap<String, CachedUsage>>,
-    /// Slots with a token refresh in flight — a second refresh of the same
-    /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -258,9 +172,6 @@ pub struct AgentAccounts {
 
 impl AgentAccounts {
     pub fn new(config: AgentAccountsConfig) -> Self {
-        // Startup sweep: a previous process that crashed mid-login leaves
-        // `.login-<uuid>` throwaway CODEX_HOME dirs — each may hold live OAuth
-        // tokens — with no owner to clean them. Reclaim them at boot.
         let root = config.root_dir();
         if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
@@ -285,9 +196,6 @@ impl AgentAccounts {
         }
     }
 
-    // ── list ────────────────────────────────────────────────────────────────
-
-    /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         if force_usage {
             lock(&self.inner.usage_cache).clear();
@@ -318,8 +226,6 @@ impl AgentAccounts {
         if let Some(detected) = self.detect_cursor() {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
-            // The SDK's minted keys expire (90-day default) — an expired live
-            // key fails every run with an auth error, so say so up front.
             if !self.cursor_live_usable() {
                 warnings.push(AgentAccountWarning {
                     harness: HarnessId::Cursor,
@@ -329,8 +235,6 @@ impl AgentAccounts {
             }
         }
 
-        // Stable presentation order: provider, then slot creation order (never
-        // active-first — switching must not reshuffle the cards).
         let mut accounts: Vec<AgentAccount> = Vec::new();
         for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Cursor] {
             let active_key = active_keys.get(&harness).cloned();
@@ -342,9 +246,6 @@ impl AgentAccounts {
                     id: slot.id.clone(),
                     harness,
                     email: Some(slot.profile.email.clone()),
-                    // A live plan from the usage probe (Codex `plan_type`)
-                    // supersedes the login-time snapshot; fall back to the
-                    // snapshot when the probe wasn't forced or failed.
                     plan_label: usage
                         .as_ref()
                         .and_then(|usage| usage.plan_label.clone())
@@ -358,8 +259,6 @@ impl AgentAccounts {
                     saved_at: Some(slot.saved_at),
                 });
             }
-            // A live login whose credentials we couldn't read has no slot — still
-            // show it (active, but not re-activatable until the Keychain relents).
             if let Some(u) = unreadable.get(&harness)
                 && !slots.iter().any(|s| s.account_key == u.account_key)
             {
@@ -381,11 +280,6 @@ impl AgentAccounts {
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
-    // ── swap ────────────────────────────────────────────────────────────────
-
-    /// Swap the CLI's live login to a saved slot. Detection runs first, so the
-    /// CURRENT login is snapshotted into its slot before being overwritten (the
-    /// claude-swap trick — a swap never strands the session it replaces).
     pub async fn activate(
         &self,
         harness: HarnessId,
@@ -415,19 +309,9 @@ impl AgentAccounts {
     }
 
     async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
-        // Slot owns the account login; live owns MCP/plugin OAuth that lives in
-        // the same blob. A wholesale replace would restore stale (or empty)
-        // mcpOAuth from the target snapshot and force every MCP to re-auth.
         let (live, _) = self.read_claude_credentials().await;
         let credentials = compose_claude_credentials(&slot.credentials, live.as_ref());
         self.write_claude_credentials(&credentials).await?;
-        // Merge the identity back into ~/.claude.json — everything else (caches,
-        // project history, onboarding flags, mcpServers) is left untouched, which
-        // is all Claude Code needs to treat this as a fresh login.
-        //
-        // GUARD the merge: a parse failure on an EXISTING file means "don't touch
-        // it", not "start fresh" — writing only our identity fields would destroy
-        // the user's entire Claude config. Only a missing file may start from {}.
         let file = &self.inner.config.claude_config_file;
         let cfg = read_json(file);
         if cfg.is_none() && file.exists() {
@@ -464,8 +348,6 @@ impl AgentAccounts {
                 map.remove("userID");
             }
         }
-        // Atomic: Claude Code rewrites this file frequently — a torn write from
-        // our side must never be readable as "empty config".
         write_file_atomic(file, merged.to_string().as_bytes(), false)
     }
 
@@ -476,16 +358,11 @@ impl AgentAccounts {
         write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
     }
 
-    // ── forget ──────────────────────────────────────────────────────────────
-
     pub async fn forget(
         &self,
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
-        // Reject anything that isn't a slot id (16 lowercase hex) BEFORE touching
-        // the filesystem: `account_id` is a raw RPC string that becomes a path,
-        // so a crafted id (`../../…`) must never reach `remove_file`.
         if account_id.len() != 16
             || !account_id
                 .bytes()
@@ -512,8 +389,6 @@ impl AgentAccounts {
         self.list(false).await
     }
 
-    // ── add-account OAuth flows ─────────────────────────────────────────────
-
     pub async fn start_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
         self.sweep_flows();
         match harness {
@@ -528,7 +403,6 @@ impl AgentAccounts {
 
     fn start_claude_login(&self) -> AgentLoginStart {
         let login_id = new_id();
-        // PKCE: 32 random bytes (two v4 uuids) as the verifier, S256 challenge.
         let raw: Vec<u8> = uuid::Uuid::new_v4()
             .as_bytes()
             .iter()
@@ -558,10 +432,6 @@ impl AgentAccounts {
         }
     }
 
-    /// Supersede — and reap — any pending spawned flow for `harness` (codex:
-    /// `codex login` binds a fixed loopback OAuth port, so a lingering flow
-    /// makes every retry exit on EADDRINUSE; cursor: one flow is simply the
-    /// sane state).
     fn reap_spawned_flows(&self, harness: HarnessId) {
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
@@ -576,8 +446,6 @@ impl AgentAccounts {
     async fn start_codex_login(&self) -> Result<AgentLoginStart, EngineError> {
         self.reap_spawned_flows(HarnessId::Codex);
         let login_id = new_id();
-        // A throwaway CODEX_HOME isolates the new login completely — the live
-        // ~/.codex session is never touched until the user explicitly switches.
         let home = self
             .inner
             .config
@@ -591,12 +459,6 @@ impl AgentAccounts {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        // The CLI opens the authorization tab itself (via the `webbrowser`
-        // crate) AND the app opens the page when this start reply lands —
-        // users got TWO identical auth.openai.com tabs. `webbrowser` prefers
-        // $BROWSER over xdg-open, so a no-op script there keeps the CLI's
-        // open quiet; a failed open is advisory to `codex login` (it prints
-        // the URL and keeps serving the loopback callback either way).
         #[cfg(unix)]
         if let Some(noop_browser) = ensure_noop_browser(&self.inner.config.root_dir()) {
             command.env("BROWSER", noop_browser);
@@ -615,9 +477,6 @@ impl AgentAccounts {
             }
         };
 
-        // codex prints the authorize URL (to stderr as of 0.142 — scan both
-        // streams); grab it so the app can open the single authorization tab
-        // (the CLI's own browser-open is suppressed via BROWSER above).
         let (child, output, exit) = wire_login_child(child);
 
         lock(&self.inner.flows).insert(
@@ -639,10 +498,6 @@ impl AgentAccounts {
         })
     }
 
-    /// Cursor: the SDK's own PKCE browser flow, driven through the zeron shim
-    /// in login mode. The minted key lands in a throwaway store file (never
-    /// the live `~/.cursor/sdk/auth.json`), then snapshots into a slot on
-    /// poll — mirroring codex's throwaway `CODEX_HOME`.
     async fn start_cursor_login(&self) -> Result<AgentLoginStart, EngineError> {
         self.reap_spawned_flows(HarnessId::Cursor);
         let login_id = new_id();
@@ -692,8 +547,6 @@ impl AgentAccounts {
         })
     }
 
-    /// Exchange the pasted `code#state` for tokens and save the account as a slot
-    /// (the live login is untouched — switching is an explicit, separate act).
     pub async fn complete_login(
         &self,
         login_id: &str,
@@ -757,7 +610,6 @@ impl AgentAccounts {
             ));
         };
 
-        // Best-effort profile fetch — fills in the plan/org the way Claude Code does.
         let profile: Option<serde_json::Value> = match self
             .inner
             .http
@@ -882,10 +734,6 @@ impl AgentAccounts {
         });
         if let Some(detected) = detected {
             self.snapshot_detected(harness, &detected)?;
-            // Cursor "Connect" semantics: with no (usable) live login, the
-            // fresh key becomes the live one immediately — the page's CTA is
-            // "connect so runs work", not "add a spare". A live login stays
-            // untouched (switching remains explicit, codex parity).
             if harness == HarnessId::Cursor
                 && !self.cursor_live_usable()
                 && let Some(credentials) = &detected.credentials
@@ -905,8 +753,6 @@ impl AgentAccounts {
                 "The sign-in finished without credentials.".to_string()
             } else {
                 let output = lock(&output);
-                // The cursor shim reports failures as a JSONL fatal frame;
-                // codex prints plain text. Surface the human part.
                 scan_shim_fatal(&output).unwrap_or_else(|| {
                     output
                         .trim()
@@ -927,9 +773,6 @@ impl AgentAccounts {
         })
     }
 
-    /// Drop a flow: kill a pending login child (`codex login` holds the fixed
-    /// loopback OAuth port; the cursor shim polls Cursor's backend) and
-    /// reclaim its throwaway home dir. Idempotent.
     pub fn cancel_login(&self, login_id: &str) {
         let flow = lock(&self.inner.flows).remove(login_id);
         if let Some(LoginFlow::Spawned { child, home, .. }) = flow {
@@ -940,8 +783,6 @@ impl AgentAccounts {
         }
     }
 
-    /// Engine shutdown: kill any in-flight login child so an orphan `codex login`
-    /// can't survive the restart and brick the next attempt.
     pub fn shutdown(&self) {
         let ids: Vec<String> = lock(&self.inner.flows).keys().cloned().collect();
         for id in ids {
@@ -949,8 +790,6 @@ impl AgentAccounts {
         }
     }
 
-    /// Lazy TTL sweep (zeron uses a background fiber; native reaps on the next
-    /// accounts call — same bound, no standing task).
     fn sweep_flows(&self) {
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
@@ -961,8 +800,6 @@ impl AgentAccounts {
             self.cancel_login(&id);
         }
     }
-
-    // ── detection ───────────────────────────────────────────────────────────
 
     async fn detect_claude(&self) -> (Option<Detected>, Option<String>) {
         let cfg = read_json(&self.inner.config.claude_config_file);
@@ -1008,8 +845,6 @@ impl AgentAccounts {
         read_json(&self.inner.config.cursor_sdk_auth_file).and_then(parse_cursor_auth)
     }
 
-    /// A live cursor login that runs can actually use: present, parseable,
-    /// and not past the minted key's expiry.
     fn cursor_live_usable(&self) -> bool {
         read_json(&self.inner.config.cursor_sdk_auth_file)
             .is_some_and(|auth| cursor_key_usable(&auth))
@@ -1025,7 +860,6 @@ impl AgentAccounts {
         write_file_atomic(file, json.as_bytes(), true)
     }
 
-    /// Persist a detected login into its slot (refreshing stored tokens).
     fn snapshot_detected(&self, harness: HarnessId, d: &Detected) -> Result<(), EngineError> {
         let Some(credentials) = &d.credentials else {
             return Ok(());
@@ -1042,10 +876,6 @@ impl AgentAccounts {
         })
     }
 
-    // ── Claude credential store (Keychain on macOS, file elsewhere) ─────────
-
-    /// Read the live Claude credentials. `None` payload + warning ⇒ we know a
-    /// login exists but couldn't read the secret (Keychain denied us).
     async fn read_claude_credentials(&self) -> (Option<serde_json::Value>, Option<String>) {
         if let Some(creds) = read_json(&self.inner.config.claude_creds_file()) {
             return (Some(creds), None);
@@ -1065,22 +895,17 @@ impl AgentAccounts {
         let json = credentials.to_string();
         #[cfg(target_os = "macos")]
         {
-            // claude-swap's primitive: update the Keychain item in place — but only
-            // when no credentials FILE exists (the file wins when present).
             if !self.inner.config.claude_creds_file().exists() {
                 return keychain::write_credentials(&json).await;
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
-        // Atomic + owner-only from birth — live tokens.
         write_file_atomic(
             &self.inner.config.claude_creds_file(),
             json.as_bytes(),
             true,
         )
     }
-
-    // ── slot files ──────────────────────────────────────────────────────────
 
     fn slots_dir(&self, harness: HarnessId) -> Result<PathBuf, EngineError> {
         let dir = self.inner.config.root_dir().join(harness_slug(harness));
@@ -1101,7 +926,6 @@ impl AgentAccounts {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // One malformed slot file must skip THAT slot, not brick the page.
             if let Some(slot) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|raw| serde_json::from_str::<Slot>(&raw).ok())
@@ -1109,9 +933,6 @@ impl AgentAccounts {
                 slots.push(slot);
             }
         }
-        // Creation order — stable across switches (saved_at churns on every
-        // auto-snapshot; created_at never does). account_key breaks ties for
-        // legacy slots that share a millisecond.
         slots.sort_by(|a, b| {
             let a_at = a.created_at.unwrap_or(a.saved_at);
             let b_at = b.created_at.unwrap_or(b.saved_at);
@@ -1130,17 +951,12 @@ impl AgentAccounts {
             .and_then(|raw| serde_json::from_str(&raw).ok());
         let mut full = slot.clone();
         if let Some(e) = existing {
-            // Preserve the first-seen stamp so activate/list reshuffles never
-            // reorder cards.
             full.created_at = e
                 .created_at
                 .or(Some(e.saved_at))
                 .or(slot.created_at)
                 .or(Some(slot.saved_at));
         } else {
-            // New slot: keep wall-clock time, but never collide with a peer's
-            // created_at (same-ms writes used to make sort order filesystem-
-            // dependent and flake CI).
             let now = slot.created_at.unwrap_or(slot.saved_at);
             let max_peer = self
                 .read_slots(slot.harness)
@@ -1152,12 +968,8 @@ impl AgentAccounts {
         }
         let json = serde_json::to_string_pretty(&full)
             .map_err(|e| EngineError::Other(format!("serialize slot: {e}")))?;
-        // Atomic + 0600 from birth: tokens must never be world-readable, and a
-        // crash mid-write must never leave torn JSON.
         write_file_atomic(&file, json.as_bytes(), true)
     }
-
-    // ── remaining usage ─────────────────────────────────────────────────────
 
     async fn usage_for(
         &self,
@@ -1173,7 +985,6 @@ impl AgentAccounts {
             return usage.clone();
         }
         if !force {
-            // Non-forced lists never hit the network (see module docs).
             return None;
         }
         let usage = match harness {
@@ -1185,11 +996,7 @@ impl AgentAccounts {
         usage
     }
 
-    async fn claude_usage(
-        &self,
-        slot: &Slot,
-        is_active: bool,
-    ) -> Option<UsageSnapshot> {
+    async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<UsageSnapshot> {
         let oauth = slot.credentials.get("claudeAiOauth")?;
         let mut access_token = str_field(oauth, "accessToken")?;
         let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
@@ -1197,8 +1004,6 @@ impl AgentAccounts {
             && expires_at < now_ms() + 30_000
         {
             if is_active {
-                // The CLI owns this token pair — rotating its refresh token out
-                // from under a running Claude Code could force a re-login.
                 return None;
             }
             access_token = self.refresh_claude_slot(slot).await?;
@@ -1237,7 +1042,6 @@ impl AgentAccounts {
 
     async fn codex_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
         let tokens = slot.credentials.get("tokens")?;
-        // api-key mode has no ChatGPT rate windows.
         let access_token = str_field(tokens, "access_token")?;
         let body: serde_json::Value = self
             .inner
@@ -1276,17 +1080,13 @@ impl AgentAccounts {
         if windows.is_empty() {
             return None;
         }
-        // Live plan ("free"/"plus"/"pro"…) — beats the login-time JWT claim,
-        // so a plan change shows up on the next forced refresh without a
-        // re-login.
         let plan_label = codex_plan(str_field(&body, "plan_type").as_deref());
-        Some(UsageSnapshot { windows, plan_label })
+        Some(UsageSnapshot {
+            windows,
+            plan_label,
+        })
     }
 
-    /// Refresh a saved Claude slot's expired access token so its usage stays
-    /// queryable. NEVER called for the active login. Single-flight per slot:
-    /// OAuth refresh tokens are commonly single-use, and a concurrent second
-    /// POST of the same one would revoke the family and brick the slot.
     async fn refresh_claude_slot(&self, slot: &Slot) -> Option<String> {
         if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
             return None;
@@ -1334,9 +1134,6 @@ impl AgentAccounts {
             );
         }
         let mut refreshed = slot.clone();
-        // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
-        // as oauth-only would drop them, and a later activate of this slot
-        // would have nothing to merge if live credentials were also empty.
         refreshed.credentials = with_claude_ai_oauth(&slot.credentials, updated);
         refreshed.saved_at = now_ms();
         if let Err(err) = self.write_slot(&refreshed) {
@@ -1346,15 +1143,6 @@ impl AgentAccounts {
     }
 }
 
-// ── macOS Keychain (documented here; compiled only on macOS) ────────────────
-//
-// Claude Code stores its credentials in the login Keychain under the service
-// `Claude Code-credentials`, account = the current username. Reads use
-// `security find-generic-password` — two-step (existence probe needs no
-// authorization, then `-w` for the secret) so a user denial is distinguishable
-// from "not logged in". Writes use `add-generic-password -U` (update in place).
-// Every call is bounded at 15s: an unanswered Keychain consent dialog blocks
-// `security` INDEFINITELY, and this runs on every list.
 #[cfg(target_os = "macos")]
 mod keychain {
     use super::*;
@@ -1440,8 +1228,6 @@ mod keychain {
     }
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
 fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
@@ -1470,8 +1256,6 @@ fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Decode a JWT payload without verifying — we only mine identity claims from a
-/// token the user's own CLI already trusts.
 fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = BASE64_URL
@@ -1486,7 +1270,6 @@ fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
     crate::repos::hex(&digest)[..16].to_string()
 }
 
-/// Pretty plan label from Claude's org type + rate-limit tier ("Max 20×").
 fn claude_plan(org_type: Option<&str>, tier: Option<&str>) -> Option<String> {
     let base = match org_type {
         Some("claude_max") => "Max",
@@ -1495,7 +1278,6 @@ fn claude_plan(org_type: Option<&str>, tier: Option<&str>) -> Option<String> {
         Some("claude_enterprise") => "Enterprise",
         _ => return None,
     };
-    // "…_20x" style tiers carry a multiplier suffix.
     let mult = tier.and_then(|t| {
         let stem = t.strip_suffix('x')?;
         let digits: String = stem
@@ -1527,11 +1309,6 @@ fn codex_plan(plan: Option<&str>) -> Option<String> {
     ))
 }
 
-/// Meter label for a Codex rate-limit window from its `limit_window_seconds`:
-/// the free tier's window is a 30-day month (2_592_000s), Plus runs a 5-hour
-/// primary (~18_000s) with a weekly secondary (604_800s). A bare "> 1 day =
-/// week" rule mislabeled the monthly window "Week"; thresholds in seconds
-/// leave the middle gaps to the nearest label rather than guessing a plan.
 fn codex_window_label(span_seconds: i64) -> &'static str {
     const DAY: i64 = 86_400;
     if span_seconds >= 28 * DAY {
@@ -1543,13 +1320,6 @@ fn codex_window_label(span_seconds: i64) -> &'static str {
     }
 }
 
-/// Compose a target Claude login with the machine's current shared fields.
-///
-/// `claudeAiOauth` (and any other slot-owned sibling, including
-/// `trustedDeviceToken`) come from `target`. Allowlisted shared keys come
-/// from `live`, presence and absence alike — a key the live blob no longer
-/// holds is not resurrected from the slot. When there is no live JSON object
-/// (or the target is not a Claude OAuth blob), `target` is returned unchanged.
 fn compose_claude_credentials(
     target: &serde_json::Value,
     live: Option<&serde_json::Value>,
@@ -1592,7 +1362,6 @@ fn compose_claude_credentials(
     serde_json::Value::Object(composed)
 }
 
-/// Replace `claudeAiOauth` without dropping sibling keys on the same blob.
 fn with_claude_ai_oauth(
     credentials: &serde_json::Value,
     oauth: serde_json::Value,
@@ -1607,7 +1376,6 @@ fn with_claude_ai_oauth(
     }
 }
 
-/// Parse a codex `auth.json` (the live one or a fresh login's).
 fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     if let Some(id_token) = auth
         .get("tokens")
@@ -1657,9 +1425,6 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
-/// ISO string (Claude) or unix seconds (Codex) → timestamp.
-/// The Cursor SDK's credential store (`StoredSdkCredentials`, version 1):
-/// the named user API key its browser login minted, plus identity/expiry.
 fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
     let api_key = str_field(&auth, "apiKey")?;
     let email = str_field(&auth, "email");
@@ -1668,8 +1433,6 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
         format!("api-key:{}", &crate::repos::hex(&digest)[..12])
     });
     let expires_at = auth.get("apiKeyExpiresAtMs").and_then(|v| v.as_i64());
-    // The key's expiry doubles as the plan chip — with 90-day keys it is the
-    // one fact worth showing on the card.
     let plan = expires_at.and_then(|ms| {
         let when = DateTime::<Utc>::from_timestamp_millis(ms)?;
         Some(if ms < now_ms() {
@@ -1698,7 +1461,6 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
-/// Present, parseable, and unexpired — what a run can actually use.
 fn cursor_key_usable(auth: &serde_json::Value) -> bool {
     str_field(auth, "apiKey").is_some()
         && auth
@@ -1724,7 +1486,6 @@ fn scan_openai_url(output: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// First JSONL frame with the given `ev` in a cursor-shim output accumulator.
 fn scan_shim_event(output: &str, ev: &str) -> Option<serde_json::Value> {
     output.lines().find_map(|line| {
         let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
@@ -1746,10 +1507,6 @@ type LoginChildHandles = (
     Arc<Mutex<Option<Option<i32>>>>,
 );
 
-/// Wire a spawned login child: both pipes accumulate into one output buffer
-/// (the URL can land on either stream), and a monitor polls `try_wait` so the
-/// child is reaped without owning it — the cancel path needs concurrent kill
-/// access.
 fn wire_login_child(mut child: tokio::process::Child) -> LoginChildHandles {
     let output = Arc::new(Mutex::new(String::new()));
     for pipe in [
@@ -1809,9 +1566,6 @@ fn wire_login_child(mut child: tokio::process::Child) -> LoginChildHandles {
     (child, output, exit)
 }
 
-/// Wait briefly for the login child to print its authorize URL (empty when it
-/// exits or stays silent past the deadline — the flow still completes via
-/// poll; the UI just can't offer an open-browser button).
 async fn await_login_url(
     output: &Arc<Mutex<String>>,
     exit: &Arc<Mutex<Option<Option<i32>>>>,
@@ -1829,10 +1583,6 @@ async fn await_login_url(
     }
 }
 
-/// Path of the no-op "browser" script `start_codex_login` hands the CLI via
-/// `BROWSER` so `codex login` doesn't open a second authorization tab (the
-/// app opens the one tab). Unix only — `webbrowser` only consults `BROWSER`
-/// on unix; elsewhere the CLI's own open is left as-is.
 #[cfg(unix)]
 fn ensure_noop_browser(root: &Path) -> Option<PathBuf> {
     const SCRIPT: &str = "#!/bin/sh\nexit 0\n";
@@ -1845,8 +1595,6 @@ fn ensure_noop_browser(root: &Path) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Minimal percent-encoding for OAuth query params (matches `encodeURIComponent`
-/// for the constant inputs used here).
 fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
     for byte in input.bytes() {
@@ -1869,7 +1617,6 @@ fn urlencode(input: &str) -> String {
     out
 }
 
-/// Atomic write via a same-dir temp file + rename; `secret` = 0600 from birth.
 fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), EngineError> {
     let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
     {
@@ -1916,19 +1663,14 @@ mod tests {
 
     #[test]
     fn codex_window_labels_track_the_window_span() {
-        // Codex free tier: one 30-day window (observed live:
-        // limit_window_seconds = 2_592_000) — NOT a week.
         assert_eq!(codex_window_label(2_592_000), "Month");
-        // Plus: 5-hour primary + weekly secondary.
         assert_eq!(codex_window_label(18_000), "Session");
         assert_eq!(codex_window_label(604_800), "Week");
-        // Unknown/absent span falls back to the shortest label.
         assert_eq!(codex_window_label(0), "Session");
     }
 
     #[test]
     fn cursor_auth_parses_and_gates_on_expiry() {
-        // The SDK's StoredSdkCredentials shape (credential-store.d.ts, 1.0.28).
         let live = serde_json::json!({
             "version": 1,
             "backendUrl": "https://api2.cursor.sh",
@@ -1958,11 +1700,9 @@ mod tests {
         });
         let detected = parse_cursor_auth(expired.clone()).expect("expired still detects");
         assert_eq!(detected.profile.plan.as_deref(), Some("Key expired"));
-        // No email → keyed (and labeled) off the key itself, codex-api-key style.
         assert!(detected.account_key.starts_with("api-key:"));
         assert!(!cursor_key_usable(&expired));
 
-        // No expiry field = never expires.
         assert!(cursor_key_usable(&serde_json::json!({"apiKey": "k"})));
         assert!(parse_cursor_auth(serde_json::json!({"version": 1})).is_none());
     }
@@ -2009,7 +1749,6 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert!(path.metadata().unwrap().permissions().mode() & 0o111 != 0);
         }
-        // A second ensure is idempotent (same path, same content).
         assert_eq!(ensure_noop_browser(root.path()), Some(path));
     }
 

@@ -1,37 +1,3 @@
-//! EngineRpc — the local engine-side `RpcService`: sessions, documents, and
-//! the workspace entity surface.
-//!
-//! Methods (feature-inventory §2):
-//! - `ListHarnesses` → `[HarnessDescriptor]`
-//! - `ListModels {harness}` → `[Model]`
-//! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
-//! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
-//!   re-emitted on every doc change
-//! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
-//! - `WatchSessions` → stream of `Session[]`: this engine's live statuses
-//! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
-//!   setChatArchived, deleteChat, renameDevice, markChatSeen)
-//! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
-//!   and data boundary (never forwarded)
-//! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
-//!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
-//!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
-//!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
-//!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
-//!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
-//!   real multi-account auth in M6.
-//! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
-//!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
-//!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
-//!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
-//!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
-//! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
-//!   `UploadCommit {uploadId, fileName}` → `{path}`,
-//!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
-//!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
-//!
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -86,7 +52,6 @@ struct QueueCommandParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RepoPathParams {
-    /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
     repo_path: String,
 }
@@ -94,7 +59,6 @@ struct RepoPathParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SwitchRefParams {
-    /// The checkout to switch — a session's cwd (main folder or worktree).
     repo_path: String,
     ref_name: String,
 }
@@ -131,8 +95,6 @@ struct FileSearchParams {
     chat_id: Option<String>,
     #[serde(default)]
     space_id: Option<String>,
-    /// Existing linked worktree selected for a new chat. The engine accepts it
-    /// only after verifying it against the space repository's worktree list.
     #[serde(default)]
     path: Option<String>,
 }
@@ -179,7 +141,6 @@ struct SubscribeTerminalParams {
 #[serde(rename_all = "camelCase")]
 struct WriteTerminalParams {
     terminal_id: String,
-    /// Base64 input bytes (plain UTF-8 accepted leniently).
     data: String,
 }
 
@@ -228,7 +189,6 @@ struct CompleteAgentLoginParams {
 #[serde(rename_all = "camelCase")]
 struct UploadChunkParams {
     upload_id: String,
-    /// Base64 payload chunk.
     data: String,
     #[serde(default)]
     seq: Option<u64>,
@@ -249,34 +209,23 @@ struct ReadAttachmentChunkParams {
     offset: u64,
 }
 
-/// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum MutateParams {
     #[serde(rename_all = "camelCase")]
     CreateChat {
         chat_id: String,
-        /// The project the chat is created in — fixes host device + base cwd.
-        /// `None` mints a project-less chat: `deviceId` picks the host and the
-        /// cwd defaults to `~` (expanded on the host at run time).
         #[serde(default)]
         space_id: Option<String>,
-        /// Host device for a project-less chat; ignored when `spaceId` is set.
         #[serde(default)]
         device_id: Option<String>,
         #[serde(default)]
         config: Option<ChatConfig>,
-        /// The picked ref, named on the row from the first frame (the footer
-        /// read "Select ref" until the diff reconciler stamped it).
         #[serde(default)]
         branch: Option<String>,
-        /// Cwd override (isolated-worktree path); default = the space's folder.
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// Create a space (device + folder pair). Idempotent by id; a live
-    /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
-    /// picker's FolderEntry — the owning device's SpacesSync re-verifies.
     #[serde(rename_all = "camelCase")]
     CreateSpace {
         space_id: String,
@@ -287,31 +236,20 @@ enum MutateParams {
         #[serde(default)]
         git_detected: bool,
     },
-    /// LWW display-name set; `name: None` clears back to basename(path).
     #[serde(rename_all = "camelCase")]
     RenameSpace {
         space_id: String,
         #[serde(default)]
         name: Option<String>,
     },
-    /// Hard delete: cascades to every chat (and session row) in the space.
-    /// Live runs hosted here are interrupted best-effort.
     #[serde(rename_all = "camelCase")]
     DeleteSpace { space_id: String },
     #[serde(rename_all = "camelCase")]
     RenameChat { chat_id: String, title: String },
-    /// Set the chat's checkout branch label — the sidebar's
-    /// "project · branch" sub-line.
     #[serde(rename_all = "camelCase")]
     SetChatBranch { chat_id: String, branch: String },
-    /// Retarget a chat onto another folder — mid-session switch to an
-    /// EXISTING worktree (the picked ref's checkout). Next run starts a
-    /// fresh harness conversation there (resume is cwd-scoped).
     #[serde(rename_all = "camelCase")]
     SetChatCwd { chat_id: String, cwd: String },
-    /// Backdate a chat's activity timestamps (epoch ms) — the sidebar's
-    /// relative-time column. Used by tooling/seeds; the doc fold sets these on
-    /// real message traffic.
     #[serde(rename_all = "camelCase")]
     SetChatActivity {
         chat_id: String,
@@ -320,23 +258,16 @@ enum MutateParams {
         #[serde(default)]
         created_at: Option<i64>,
     },
-    /// Re-home a chat to another device (tooling/seeds; device migration later).
     #[serde(rename_all = "camelCase")]
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
-    /// Full-config replace on the chat row (zeron `SetChatConfig`): the
-    /// composer's mid-session model / reasoning / options changes, persisted
-    /// so they survive restarts and reach every device.
     #[serde(rename_all = "camelCase")]
     SetChatConfig { chat_id: String, config: ChatConfig },
-    /// Tombstone: removes the chats-map row; the session doc remains.
     #[serde(rename_all = "camelCase")]
     DeleteChat { chat_id: String },
     #[serde(rename_all = "camelCase")]
     RenameDevice { device_id: String, name: String },
-    /// Seen marker (LWW + monotonic guard): clears the "completed"
-    /// badge on every device. `at` is epoch ms; default = now.
     #[serde(rename_all = "camelCase")]
     MarkChatSeen {
         chat_id: String,
@@ -359,7 +290,7 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
-    #[allow(clippy::too_many_arguments)] // engine assembly seam, not a public API
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sessions: SessionsEngine,
         doc_host: DocHost,
@@ -390,9 +321,6 @@ impl EngineRpc {
         }
     }
 
-    /// Resolve a mention-search root from local workspace rows.
-    /// name an existing linked worktree for a new chat, but it is verified
-    /// against the space repository before any filesystem walk begins.
     async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
         let local_device = self.doc_host.device_id();
         match (&p.chat_id, &p.space_id) {
@@ -469,10 +397,6 @@ impl EngineRpc {
         }
     }
 
-    /// Most-recent-first paths the current chat actually touched, followed by
-    /// files still changed in its checkout. The search worker validates and
-    /// normalizes them against the resolved root before using them as ranking
-    /// hints, so stale or out-of-workspace tool paths simply disappear.
     fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
@@ -567,9 +491,6 @@ impl EngineRpc {
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
-                // Best-effort teardown of live runs we host for the deleted chats
-                // (the doc rows are already tombstoned; a straggler run would only
-                // write into an orphaned session doc).
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
                 let chat_ids = deleted.chat_ids;
@@ -645,7 +566,6 @@ impl EngineRpc {
     }
 }
 
-/// A watch receiver as a stream: current value first, then every change.
 fn watch_stream<T>(rx: watch::Receiver<T>) -> BoxStream<'static, serde_json::Value>
 where
     T: serde::Serialize + Clone + Send + Sync + 'static,
@@ -663,9 +583,6 @@ where
     .boxed()
 }
 
-/// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
-/// full `reset` first, then only changed entries per commit — the whole-Vec
-/// serialization here was the per-tick cost that scaled with transcript size.
 fn doc_messages_stream(
     rx: watch::Receiver<Vec<zeron_doc::SessionMessageEntry>>,
 ) -> BoxStream<'static, serde_json::Value> {
@@ -683,8 +600,6 @@ fn doc_messages_stream(
                     Some(prev) => diff_transcript(prev, &current),
                 };
                 prev = Some(current);
-                // No-op commits (a second watcher attaching, command-only
-                // changes) produce empty deltas — skip the frame entirely.
                 if frame.is_empty_delta() {
                     continue;
                 }
@@ -708,8 +623,6 @@ impl RpcService for EngineRpc {
                 self.registry
                     .set_enabled(p.harness, p.enabled)
                     .map_err(RpcError::Failed)?;
-                // Fresh catalog in the reply: the page repaints from it in one
-                // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::LIST_MODELS => {
@@ -725,9 +638,6 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery. Non-ACP harnesses return
-                // an empty list from the trait default.
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
                     .registry
@@ -767,7 +677,6 @@ impl RpcService for EngineRpc {
                 self.workspace.watch_spaces(),
             ))),
             methods::WATCH_SESSIONS => {
-                // Local live statuses merged with the local workspace rows.
                 let merged = self
                     .workspace
                     .merged_sessions_watch(self.sessions.watch_sessions());
@@ -781,13 +690,7 @@ impl RpcService for EngineRpc {
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
-            // One-shot scoped capture for the Changes pane: `branch` diffs the
-            // working tree against merge-base(baseRef, HEAD); `turn` diffs the
-            // turn-start tree snapshot against the current tree; anything else
-            // is the plain working-tree capture.
             methods::GET_CHECKOUT_DIFF => {
-                // Keep the scoped-diff future off the dispatcher's stack. The
-                // per-commit path adds another nested git-capture future.
                 Box::pin(async move {
                     #[derive(Deserialize)]
                     #[serde(rename_all = "camelCase")]
@@ -818,8 +721,6 @@ impl RpcService for EngineRpc {
                             crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
                                 .await
                         }
-                        // One commit's own changes (History → per-commit tab):
-                        // parent (or the empty tree) vs the commit itself.
                         "commit" => {
                             let sha = p
                                 .commit_sha
@@ -859,9 +760,6 @@ impl RpcService for EngineRpc {
                 .await
             }
             methods::GET_CHECKOUT_FILE_DIFF_TEXT => {
-                // This branch contains several large nested async futures. Keep it
-                // behind an allocation so every unrelated RPC does not carry that
-                // state in `EngineRpc::handle`'s stack frame.
                 Box::pin(async move {
                     let p: zeron_proto::GetCheckoutFileDiffTextRequest = parse_params(params)?;
                     let identity =
@@ -1097,9 +995,6 @@ impl RpcService for EngineRpc {
                     .fetch_all(std::path::Path::new(&p.repo_path))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                // Remote refs are repository state too. Force the checkout
-                // watchers to publish a fresh snapshot instead of waiting for
-                // the repair tick (some platforms do not report packed-refs).
                 self.diff_sync.sync_all();
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
@@ -1167,8 +1062,6 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
                 let cwd = self
                     .workspace
                     .chat(&p.chat_id)
@@ -1292,7 +1185,6 @@ impl RpcService for EngineRpc {
             }
             methods::READ_ATTACHMENT_CHUNK => {
                 let p: ReadAttachmentChunkParams = parse_params(params)?;
-                // Path jail: the uploads dir plus every workspace-known chat cwd.
                 let roots: Vec<std::path::PathBuf> = self
                     .workspace
                     .read_chats()
@@ -1316,8 +1208,6 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
-    /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
-    /// Legacy account fields are tolerated for clients that reuse this helper.
     #[test]
     fn agent_account_params_accept_ui_shape() {
         let p: AgentAccountParams = parse_params(serde_json::json!({

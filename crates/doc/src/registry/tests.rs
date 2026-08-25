@@ -1,5 +1,3 @@
-//! RegistryDoc unit tests for local merge and typed-API behavior.
-
 use super::*;
 use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
 
@@ -62,8 +60,6 @@ fn applied(row: Option<&RegistryRow>, op: &RowOp) -> RegistryRow {
     next.expect("row after change")
 }
 
-// ── merge semantics (mirror of registry-core.test.ts) ───────────────────────
-
 #[test]
 fn hlc_orders_lexicographically() {
     assert!(hlc(2) > hlc(1));
@@ -76,8 +72,8 @@ fn hlc_orders_lexicographically() {
 fn hlc_clock_is_monotonic_across_regressions() {
     let mut clock = HlcClock::default();
     let a = clock.next(1_000, "d");
-    let b = clock.next(500, "d"); // wall clock went backwards
-    let c = clock.next(1_000, "d"); // and stalled
+    let b = clock.next(500, "d");
+    let c = clock.next(1_000, "d");
     assert!(b > a);
     assert!(c > b);
 }
@@ -102,7 +98,6 @@ fn field_lww_newer_wins_older_and_ties_lose() {
     );
     let (_, changed) = apply_op(Some(&row), &update(&[("title", json!("stale"))], hlc(500)));
     assert!(!changed);
-    // Exact replay: strict-> compare makes re-pushes idempotent.
     let (_, changed) = apply_op(
         Some(&row),
         &upsert(
@@ -155,13 +150,11 @@ fn delete_only_wins_when_causally_newer() {
     let gone = applied(Some(&row), &delete(2000));
     assert!(gone.deleted);
     assert!(gone.fields.is_empty());
-    // Updates never touch tombstones.
     let (_, changed) = apply_op(
         Some(&gone),
         &update(&[("title", json!("ghost"))], hlc(3000)),
     );
     assert!(!changed);
-    // Older upsert can't revive; newer revives from ONLY its own fields.
     let (_, changed) = apply_op(Some(&gone), &upsert(&[("title", json!("old"))], 1500));
     assert!(!changed);
     let revived = applied(Some(&gone), &upsert(&[("title", json!("back"))], 4000));
@@ -196,7 +189,6 @@ fn seed_ops_preserve_original_causality() {
         &update(&[("status", json!("errored"))], hlc(5000)),
     );
     assert!(!changed);
-    // Tombstones round-trip too.
     let gone = applied(None, &delete(7000));
     let reseeded = applied(None, &row_to_seed_op(&gone));
     assert!(reseeded.deleted);
@@ -205,7 +197,6 @@ fn seed_ops_preserve_original_causality() {
 
 #[test]
 fn wire_shapes_are_stable() {
-    // The exact JSON the TS side produces/consumes (registry-core.ts).
     let op: RowOp = serde_json::from_value(json!({
         "kind": "chats", "id": "chat-1", "op": "upsert",
         "set": {"title": "hi", "gone": null},
@@ -223,7 +214,7 @@ fn wire_shapes_are_stable() {
     .unwrap();
     assert_eq!(row.seq, 7);
     let back = serde_json::to_value(&row).unwrap();
-    assert_eq!(back["delHlc"], Value::Null); // skipped, not "del_hlc"
+    assert_eq!(back["delHlc"], Value::Null);
     assert!(back.get("del_hlc").is_none());
     let del: RowOp = serde_json::from_value(json!({
         "kind": "chats", "id": "c", "op": "delete", "hlc": "0000000001000-000000-d"
@@ -231,8 +222,6 @@ fn wire_shapes_are_stable() {
     .unwrap();
     assert_eq!(del.op, OpKind::Delete);
 }
-
-// ── doc lifecycle ───────────────────────────────────────────────────────────
 
 fn device(id: &str, name: &str) -> Device {
     Device {
@@ -294,14 +283,11 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     }
 }
 
-/// Stand-in for the server: applies every pushable batch from `docs` to a row
-/// table with the SAME merge fn, acks, and broadcasts merged rows to all.
 fn server_round(
     server: &mut HashMap<(String, String), RegistryRow>,
     seq: &mut u64,
     docs: &mut [&mut RegistryDoc],
 ) {
-    // Collect each doc's pushable batches first (server applies in order).
     let mut acks: Vec<(usize, String)> = Vec::new();
     let mut touched_all: Vec<RegistryRow> = Vec::new();
     let mut batches: Vec<(usize, PendingBatch)> = Vec::new();
@@ -442,7 +428,6 @@ fn chat_seen_is_monotonic() {
         ws.chat("chat-1").unwrap().unwrap().last_seen_at,
         Some(ts(5_000))
     );
-    // Older stamps are ignored without a write.
     let before = ws.pending_len();
     assert!(ws.set_chat_seen("chat-1", ts(4_000)).unwrap());
     assert_eq!(ws.pending_len(), before);
@@ -483,7 +468,6 @@ fn two_docs_converge_through_a_server() {
     assert_eq!(a.pending_len(), 0);
     assert_eq!(b.pending_len(), 0);
 
-    // Concurrent same-field rename settles identically on both.
     a.rename_chat("chat-a", "from a").unwrap();
     b.rename_chat("chat-a", "from b").unwrap();
     server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
@@ -496,21 +480,12 @@ fn two_docs_converge_through_a_server() {
     ));
 }
 
-/// The command plane outruns the registry channel: the host's
-/// claim-on-first-command lands with NEWER clocks than the viewer's earlier
-/// `createChat`. The claim writes only the fields it knows, so the viewer's
-/// `config`/`title` must still land on merge (a full-row claim's `Null`
-/// writes deleted them — the missing-harness-icon clobber).
 #[test]
 fn late_create_chat_config_survives_a_prior_claim() {
     let mut viewer = RegistryDoc::new("dev-viewer");
     let mut host = RegistryDoc::new("dev-a");
 
-    // Viewer writes the real row first (older clocks)…
     viewer.upsert_chat(&chat("chat-race", "dev-a")).unwrap();
-    // …then the host claims the same chat before that row reaches it. (Real
-    // claims trail by whole seconds; the sleep keeps the HLCs out of the
-    // same-millisecond device-id tiebreak.)
     std::thread::sleep(std::time::Duration::from_millis(2));
     host.claim_chat("chat-race", Some("/tmp/repo"), Some("space-1"), ts(9_000));
 
@@ -520,10 +495,8 @@ fn late_create_chat_config_survives_a_prior_claim() {
 
     for doc in [&viewer, &host] {
         let merged = doc.chat("chat-race").unwrap().expect("merged row");
-        // Claimed fields (newer clocks) stand…
         assert_eq!(merged.device_id, "dev-a");
         assert_eq!(merged.space_id.as_deref(), Some("space-1"));
-        // …and the fields the claim never wrote come from the createChat.
         assert_eq!(merged.config, chat("chat-race", "dev-a").config);
         assert_eq!(merged.title.as_deref(), Some("First chat"));
     }
@@ -551,7 +524,6 @@ fn delete_space_cascades_and_converges() {
     let deleted = a.delete_space("sp-1").unwrap();
     assert!(deleted.existed);
     assert_eq!(deleted.chat_ids, vec!["chat-1".to_string()]);
-    // Overlay hides the cascade locally before the server even sees it.
     assert_eq!(a.read_spaces().unwrap().len(), 1);
     server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
 
@@ -584,7 +556,6 @@ fn delete_space_cascades_and_converges() {
 fn persistence_round_trips_rows_pending_and_cursor() {
     let mut doc = RegistryDoc::new("dev-a");
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
-    // Half-sync: authoritative row + one unacked rename.
     let mut server = HashMap::new();
     let mut seq = 0u64;
     server_round(&mut server, &mut seq, &mut [&mut doc]);
@@ -611,7 +582,6 @@ fn state_frames_delta_replace_and_reseed() {
     server_round(&mut server, &mut seq, &mut [&mut doc]);
     assert_eq!(doc.cursor(), seq);
 
-    // Delta: a row someone else pushed.
     let remote = applied(
         None,
         &RowOp {
@@ -635,9 +605,6 @@ fn state_frames_delta_replace_and_reseed() {
     assert_eq!(doc.read_chats().unwrap().len(), 2);
     assert_eq!(doc.cursor(), seq + 1);
 
-    // Full replace at a newer seq drops rows the server no longer has…
-    // …except it re-seeds rows the server never saw. Here the server returns
-    // only chat-9, so chat-1 (authoritative locally) re-seeds.
     let outcome = doc.apply_state(seq + 2, true, 0, vec![remote]);
     assert_eq!(outcome, StateOutcome::Reseeded);
     assert!(doc.pending_len() > 0);
@@ -647,7 +614,6 @@ fn state_frames_delta_replace_and_reseed() {
         .expect("kept via reseed overlay");
     assert_eq!(seeded.device_id, "dev-a");
 
-    // Server behind us (wiped): local rows kept, reseed enqueued.
     let mut fresh = RegistryDoc::new("dev-a");
     fresh.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
     let mut server2 = HashMap::new();
@@ -666,8 +632,6 @@ fn reconnect_replay_is_idempotent() {
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
     let mut server = HashMap::new();
     let mut seq = 0u64;
-    // Push once, but the ack is "lost": simulate by applying to the server
-    // without acking the doc.
     let batches = doc.take_pushable();
     for batch in &batches {
         seq += 1;
@@ -682,7 +646,6 @@ fn reconnect_replay_is_idempotent() {
             }
         }
     }
-    // Reconnect: batches become pushable again and re-apply as no-ops.
     doc.mark_disconnected();
     let replay = doc.take_pushable();
     assert_eq!(replay.len(), batches.len());
@@ -697,7 +660,6 @@ fn reconnect_replay_is_idempotent() {
 
 #[test]
 fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
-    // Build a legacy loro workspace doc, materialize, seed.
     let legacy = crate::workspace::WorkspaceDoc::new();
     legacy.upsert_device(&device("dev-a", "laptop")).unwrap();
     legacy
@@ -717,11 +679,9 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
         .seed_from_workspace(&legacy.read_all().unwrap())
         .unwrap();
     assert_eq!(seeded, 4);
-    // Instant: the overlay serves the full state before any server contact.
     let state = doc.read_all().unwrap();
     assert_eq!(state, legacy.read_all().unwrap());
 
-    // Two devices seeding the same converged doc = identical result.
     let mut other = RegistryDoc::new("dev-b");
     other
         .seed_from_workspace(&legacy.read_all().unwrap())
@@ -732,7 +692,6 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     assert_eq!(doc.read_all().unwrap(), other.read_all().unwrap());
     assert_eq!(doc.read_all().unwrap(), legacy.read_all().unwrap());
 
-    // A live rename (now-clock) beats the migrated title everywhere.
     other.rename_chat("chat-1", "live rename").unwrap();
     server_round(&mut server, &mut seq, &mut [&mut doc, &mut other]);
     assert_eq!(

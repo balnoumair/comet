@@ -1,27 +1,10 @@
-//! M1 epoch rebuild (docs/chat2-sync.md) — the whale-healing step.
-//!
-//! On first chat2 seed the host does NOT upload its fat doc: it rebuilds a
-//! thin one. Every entry is copied with the A1 strip applied retroactively —
-//! fat inline tool outputs become one-line summaries, inline diffs become
-//! per-file stats — and the stripped full payloads are returned so the host
-//! can upload them to the A2 sidecar (existing whale outputs stay viewable;
-//! zero information loss). Commands: only unresolved entries carry over (the
-//! `processed_commands` mark-before-execute ledger protects against
-//! re-execution regardless).
-//!
-//! `meta.epoch = 2` marks the new lineage. Other devices seeing a
-//! `roomGen: 2` chat with a local `epoch < 2` doc discard-and-adopt (M3);
-//! the epoch check makes re-entry a no-op.
 
 use crate::SessionCommandStatus;
 use crate::parts::{MessagePart, SidecarPayload, diff_stat, summarize_tool_output};
 use crate::schema::{DocError, SessionDoc};
 
-/// Doc lineage epoch written by [`rebuild_thin_doc`]. Pre-migration s2 docs
-/// read back as 0.
 pub const THIN_DOC_EPOCH: u32 = 2;
 
-/// Read `meta.epoch` (0 = pre-migration doc).
 pub fn doc_epoch(doc: &SessionDoc) -> u32 {
     match doc.doc().get_map("meta").get("epoch") {
         Some(loro::ValueOrContainer::Value(loro::LoroValue::I64(n))) => n.max(0) as u32,
@@ -29,21 +12,13 @@ pub fn doc_epoch(doc: &SessionDoc) -> u32 {
     }
 }
 
-/// A completed rebuild: the thin doc plus everything it stripped out (owed
-/// to the sidecar) and the copy accounting.
 pub struct ThinRebuild {
     pub doc: SessionDoc,
-    /// Full outputs/diffs stripped from old fat parts — upload to the A2
-    /// sidecar under `{chatId}/{partId}[.diff]` before flipping `roomGen`.
     pub sidecar: Vec<SidecarPayload>,
     pub entries: usize,
     pub commands_copied: usize,
 }
 
-/// Rebuild a thin epoch-2 doc from a (possibly fat) source doc.
-///
-/// Pure over doc contents — no I/O; idempotent in the sense that rebuilding
-/// an already-thin doc strips nothing and owes the sidecar nothing.
 pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
     let chat_id = source
         .chat_id()
@@ -67,8 +42,6 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
 
     let mut commands_copied = 0;
     for command in source.read_commands()? {
-        // Only unresolved work crosses the epoch: resolved/expired ledger
-        // history is exactly the bulk a wedged room can't afford to carry.
         if command.status == SessionCommandStatus::Pending {
             thin.queue_command(&command)?;
             commands_copied += 1;
@@ -84,8 +57,6 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
     })
 }
 
-/// Apply the A1 strip to one part in place. `Some` = payload owed to the
-/// sidecar (the part was fat). Already-thin parts pass through untouched.
 fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
     let MessagePart::Tool {
         id,
@@ -105,8 +76,6 @@ fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
         output: None,
         diff: None,
     };
-    // Fat inline output = text with no sidecar ref (the new fold always
-    // stamps `output_ref` beside a summary). Blank output just drops.
     if output_ref.is_none()
         && let Some(full) = output.take()
     {
@@ -119,7 +88,6 @@ fn strip_part(chat_id: &str, part: &mut MessagePart) -> Option<SidecarPayload> {
             payload.output = Some(full);
         }
     }
-    // Inline diff text dies entirely: stats + ref replace it.
     if let Some(full) = diff.take() {
         *diff_stats = Some(vec![diff_stat(&full)]);
         if diff_ref.is_none() {
@@ -137,8 +105,6 @@ mod tests {
     use crate::{MessageStatus, SessionCommandEntry, SessionCommandPayload};
     use zeron_proto::{ToolCall, ToolDiff};
 
-    /// ~4KB of varied output — repeated text would compress away inside the
-    /// Loro snapshot and hide the size win the assertion checks.
     fn fat_output() -> String {
         let mut out = String::new();
         let mut x: u64 = 0x9e37_79b9;
@@ -167,7 +133,7 @@ mod tests {
                     },
                     is_error: false,
                     resolved: true,
-                    output: Some(fat_output()), // ~4KB fat inline, incompressible
+                    output: Some(fat_output()),
                     diff: Some(ToolDiff {
                         path: "/w/a.rs".into(),
                         old_text: Some("a\nb\n".into()),
@@ -219,7 +185,6 @@ mod tests {
         assert_eq!(doc_epoch(&source), 0);
         assert_eq!((rebuilt.entries, rebuilt.commands_copied), (1, 1));
 
-        // The whale math: the thin doc must be dramatically smaller.
         let thin_size = rebuilt.doc.export_snapshot().unwrap().len();
         assert!(
             thin_size * 2 < fat_size,
@@ -255,13 +220,11 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // Everything stripped is owed to the sidecar — nothing is lost.
         assert_eq!(rebuilt.sidecar.len(), 1);
         assert_eq!(rebuilt.sidecar[0].part_id, "m1-tool");
         assert!(rebuilt.sidecar[0].output.as_deref().unwrap().len() > 3000);
         assert_eq!(rebuilt.sidecar[0].diff.as_ref().unwrap().path, "/w/a.rs");
 
-        // Only the unresolved command crossed the epoch.
         let commands = rebuilt.doc.read_commands().unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].id, "c1");

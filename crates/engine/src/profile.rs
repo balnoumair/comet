@@ -1,9 +1,3 @@
-//! The single local workspace profile.
-//!
-//! Local-only Zeron deliberately has no account or organization profile
-//! selection. Keeping this small profile object preserves the existing on-disk
-//! layout while making the storage boundary explicit for the engine.
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

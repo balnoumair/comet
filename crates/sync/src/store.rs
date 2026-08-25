@@ -1,14 +1,9 @@
-//! `DocsStore` — local SQLite persistence for doc snapshots and the
-//! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
-//! processed BEFORE execution so a crash can never double-execute a command).
-
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -17,11 +12,7 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
-/// Ordered, append-only migrations. Each entry runs once inside a transaction;
-/// `schema_migrations` records what has been applied.
-const MIGRATIONS: &[&str] = &[
-    // v1 — snapshots + processed-command ledger
-    "CREATE TABLE snapshots (
+const MIGRATIONS: &[&str] = &["CREATE TABLE snapshots (
         doc_id   TEXT PRIMARY KEY,
         bytes    BLOB NOT NULL,
         saved_at INTEGER NOT NULL
@@ -29,19 +20,13 @@ const MIGRATIONS: &[&str] = &[
      CREATE TABLE processed_commands (
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
-     ) STRICT;",
-];
+     ) STRICT;"];
 
-/// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
-///
-/// Holds local doc snapshots for fast restarts and the command ledger that
-/// gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
 }
 
 impl DocsStore {
-    /// Open (creating directory, database, and schema as needed).
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
@@ -55,7 +40,6 @@ impl DocsStore {
         })
     }
 
-    /// Latest saved snapshot for `doc_id`, if any.
     pub fn load_snapshot(&self, doc_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let bytes = self
             .conn()
@@ -68,7 +52,6 @@ impl DocsStore {
         Ok(bytes)
     }
 
-    /// Save (upsert) the snapshot for `doc_id`.
     pub fn save_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
         self.conn().execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
@@ -78,15 +61,12 @@ impl DocsStore {
         Ok(())
     }
 
-    /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
-    /// legacy `workspace` row is dropped on open). Missing rows are a no-op.
     pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
         self.conn()
             .execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
         Ok(())
     }
 
-    /// Whether a snapshot row exists for `doc_id` — presence only, no blob read.
     pub fn has_snapshot(&self, doc_id: &str) -> Result<bool, StoreError> {
         let hit = self
             .conn()
@@ -99,7 +79,6 @@ impl DocsStore {
         Ok(hit.is_some())
     }
 
-    /// Whether `command_id` has already been claimed for execution.
     pub fn is_processed(&self, command_id: &str) -> Result<bool, StoreError> {
         let hit = self
             .conn()
@@ -112,9 +91,6 @@ impl DocsStore {
         Ok(hit.is_some())
     }
 
-    /// Claim `command_id` for execution — call BEFORE executing (ledger rule:
-    /// a crash mid-execution must never re-run the command). Returns `true`
-    /// if this call claimed it, `false` if it was already processed.
     pub fn mark_processed(&self, command_id: &str) -> Result<bool, StoreError> {
         let changed = self.conn().execute(
             "INSERT OR IGNORE INTO processed_commands (command_id, processed_at) VALUES (?1, ?2)",
@@ -124,8 +100,6 @@ impl DocsStore {
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
-        // A poisoned lock only means another thread panicked mid-query; the
-        // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -185,7 +159,6 @@ mod tests {
             store.load_snapshot("chat-1").unwrap().as_deref(),
             Some(&b"v2-longer-bytes"[..])
         );
-        // Distinct docs do not collide.
         store.save_snapshot("chat-2", b"other").unwrap();
         assert_eq!(
             store.load_snapshot("chat-1").unwrap().as_deref(),
@@ -215,7 +188,7 @@ mod tests {
             store.save_snapshot("chat-1", b"persisted").unwrap();
             store.mark_processed("cmd-1").unwrap();
         }
-        let store = DocsStore::open(dir.path()).unwrap(); // re-runs migrate()
+        let store = DocsStore::open(dir.path()).unwrap();
         assert_eq!(
             store.load_snapshot("chat-1").unwrap().as_deref(),
             Some(&b"persisted"[..])

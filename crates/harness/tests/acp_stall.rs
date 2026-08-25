@@ -1,9 +1,3 @@
-//! Prompt-stall watchdog (`ZERON_ACP_PROMPT_STALL_MS`): a grok-spec agent
-//! that goes TOTALLY silent after the prompt — the wedged-shared-leader
-//! signature from the field — must surface a visible error and an errored
-//! Done instead of indefinite Working. Own test binary: the env knob is
-//! process-global.
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,7 +22,6 @@ fn fixture_path() -> PathBuf {
 
 #[tokio::test]
 async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
-    // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
         std::env::set_var("ZERON_ACP_PROMPT_STALL_MS", "700");
     }
@@ -85,11 +78,6 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     ));
 }
 
-/// Same watchdog, opencode spec: a failing model provider is INVISIBLE on
-/// opencode's wire (the CLI retries the provider stream forever without
-/// failing `session/prompt` — verified live, 1.18.18), so the stall chip is
-/// the only feedback a user with a broken/unauthorized provider ever gets.
-/// The hint must point at the provider, not at a wedged process.
 #[tokio::test]
 async fn opencode_stall_hint_names_the_provider() {
     unsafe {

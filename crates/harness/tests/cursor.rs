@@ -1,6 +1,3 @@
-//! CursorHarness integration tests against the fake shim in
-//! `tests/fixtures/fake-cursor-shim.sh` (no node/@cursor/sdk involved).
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -57,7 +54,6 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     (controls, steer_tx, token)
 }
 
-/// Collect events until the first Done (the session parks afterwards).
 async fn run_to_first_done(
     harness: &CursorHarness,
     req: RunRequest,
@@ -109,7 +105,6 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
         diff: None,
     }));
 
-    // The task spawn is a parent chip; its interior arrives tagged, never bare.
     assert!(events.iter().any(|e| matches!(
         e,
         AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
@@ -137,9 +132,6 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
             .any(|e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "s1")),
         "subagent tool leaked into the parent feed: {events:?}"
     );
-    // The task tool's end doubles as the subagent's tagged terminal — the
-    // SDK has no separate frame for it, and without this the chip stays
-    // "running" forever.
     assert!(events.iter().any(|e| matches!(
         e,
         AgentEvent::Subagent { parent_tool_use_id, event }
@@ -292,7 +284,6 @@ async fn shim_crash_mid_run_reports_stderr_tail() {
 #[tokio::test]
 async fn model_discovery_maps_the_live_catalog() {
     let models = harness().models().await.expect("models");
-    // Parameterized Auto first; its bare `default` alias twin skipped.
     assert_eq!(models.len(), 2, "{models:?}");
     assert_eq!(models[0].id, "auto-smart");
     assert_eq!(models[0].label, "Auto");
@@ -307,11 +298,9 @@ async fn model_discovery_maps_the_live_catalog() {
             .collect::<Vec<_>>(),
         vec!["intelligence", "balanced", "cost"]
     );
-    // The default comes from the isDefault variant, not the first value.
     assert_eq!(optimize.default_choice, "balanced");
     assert_eq!(models[1].id, "claude-fable-5");
     assert_eq!(models[1].description.as_deref(), Some("Anthropic frontier"));
-    // A parameter without displayName labels by id; default = first value.
     assert_eq!(models[1].options[0].id, "thinking");
     assert_eq!(models[1].options[0].default_choice, "enabled");
 }

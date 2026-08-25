@@ -1,6 +1,3 @@
-//! zeron-engine — the local desktop backend: sessions, documents, journals,
-//! repositories, terminals, diffs, and the localhost RPC server.
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

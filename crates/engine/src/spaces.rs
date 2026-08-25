@@ -1,24 +1,3 @@
-//! SpacesSync — owner-side upkeep of space rows (git presence) plus the
-//! orphan-chat repair sweep.
-//!
-//! A space is a local (device, folder) pair; the folder need NOT be a git
-//! repo. This service watches the workspace `spaces` rows owned by THIS device
-//! and keeps their `gitDetected`/`checkoutId` stamps truthful:
-//!
-//! - recheck on boot / when a space row is first observed;
-//! - a non-recursive `notify` watcher on the space folder — `.git` appearing or
-//!   vanishing (git init / de-git) kicks a recheck;
-//! - a slow 2-minute repair tick (native watchers coalesce/drop events).
-//!
-//! Stamps are written ONLY on change, so steady state never grows the oplog.
-//! The UI reads `space.git_detected` straight from the local doc — branch
-//! pickers and the diff sidebar gate on it with zero extra RPCs.
-//!
-//! The repair tick also runs the orphan sweep: a chat created concurrently
-//! with a `deleteSpace` on another device can sync in after the cascade ran,
-//! leaving a dangling `spaceId`. The HOST device deletes its own such chats
-//! (writer discipline — we never touch other devices' rows).
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -32,17 +11,12 @@ use zeron_proto::Space;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
-/// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
-/// Slow repair pass: recheck every owned space + orphan sweep.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 
 struct SpaceEntry {
     path: PathBuf,
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the folder watcher alive; dropped on entry close. Filled
-    /// asynchronously — FSEvents registration blocks, so [`reconcile`] builds
-    /// it off the runtime and attaches it here once ready.
     folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
@@ -51,8 +25,6 @@ struct SpacesSyncInner {
     workspace: WorkspaceHost,
     device_id: String,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
-    /// Ends the supervisor loop eagerly on shutdown (weak refs alone only end
-    /// it once the whole graph drops).
     cancel: CancellationToken,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -67,8 +39,6 @@ pub struct SpacesSync {
 }
 
 impl SpacesSync {
-    /// Build and start the sync loop: follows the workspace spaces watch and
-    /// runs the repair tick. Requires a tokio runtime.
     pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
         let sync = Self {
             inner: Arc::new(SpacesSyncInner {
@@ -89,8 +59,6 @@ impl SpacesSync {
         sync
     }
 
-    /// Stop the supervisor loop and wait for it to exit (per-space tasks are
-    /// purely local and end when their entries drop). Idempotent.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
         let task = lock(&self.inner.supervisor).take();
@@ -99,7 +67,6 @@ impl SpacesSync {
         }
     }
 
-    /// Reconcile + recheck now (tests / opportunistic callers).
     pub async fn reconcile_now(&self) {
         let spaces = self.inner.workspace.watch_spaces().borrow().clone();
         reconcile(&self.inner, &spaces);
@@ -109,7 +76,6 @@ impl SpacesSync {
     }
 }
 
-/// (Re)build the entry set for the spaces THIS device owns.
 fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
     let owned: HashMap<&str, &Space> = spaces
         .iter()
@@ -121,7 +87,7 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
     entries.retain(|id, _| owned.contains_key(id.as_str()));
     for (id, space) in owned {
         if entries.contains_key(id) {
-            continue; // deviceId/path are immutable — nothing to refresh
+            continue;
         }
         let (kick_tx, kick_rx) = mpsc::unbounded_channel();
         let entry = Arc::new(SpaceEntry {
@@ -136,17 +102,12 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             Arc::downgrade(&entry),
             kick_rx,
         ));
-        let _ = kick_tx.send(()); // initial check (boot / first observed)
+        let _ = kick_tx.send(());
 
-        // Non-recursive watcher on the space folder: `.git` appearing/vanishing
-        // among the direct children is exactly the signal we need. Watch
-        // failures are fine — the repair tick still converges. Built off the
-        // runtime: FSEvents registration blocks, and reconcile runs on the
-        // spaces-watch task.
         let weak = Arc::downgrade(&entry);
         tokio::task::spawn_blocking(move || {
             let Some(entry) = weak.upgrade() else {
-                return; // entry removed before the watcher was ready
+                return;
             };
             let tx = entry.kick_tx.clone();
             let result =
@@ -166,8 +127,6 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
                     match watcher.watch(&entry.path, notify::RecursiveMode::NonRecursive) {
                         Ok(()) => {
                             *lock(&entry.folder_watch) = Some(watcher);
-                            // Close the check→attach gap: a `.git` change while
-                            // unwatched gets caught by this recheck.
                             let _ = entry.kick_tx.send(());
                         }
                         Err(err) => {
@@ -183,7 +142,6 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
     }
 }
 
-/// Per-space task: trailing-debounce kicks, then recheck git presence.
 async fn entry_task(
     inner: Weak<SpacesSyncInner>,
     space_id: String,
@@ -194,7 +152,7 @@ async fn entry_task(
         loop {
             match tokio::time::timeout(WATCH_DEBOUNCE, kick_rx.recv()).await {
                 Ok(Some(())) => continue,
-                Ok(None) => return, // entry closed mid-burst
+                Ok(None) => return,
                 Err(_) => break,
             }
         }
@@ -205,7 +163,6 @@ async fn entry_task(
     }
 }
 
-/// Probe git presence and stamp the row — write only on change.
 async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) {
     let detected = inner.repos.is_repo(path).await;
     let checkout_id = if detected {
@@ -227,10 +184,10 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
         }
     };
     let Some(current) = current else {
-        return; // deleted while checking
+        return;
     };
     if current.git_detected == detected && current.checkout_id == checkout_id {
-        return; // unchanged — no oplog growth
+        return;
     }
     match inner
         .workspace
@@ -245,8 +202,6 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
     }
 }
 
-/// Host-side repair: delete OUR chats whose `spaceId` dangles (create-vs-delete
-/// race). Chats hosted by other devices are left alone.
 fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
     let spaces = inner.workspace.watch_spaces().borrow().clone();
     let live: std::collections::HashSet<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
@@ -268,8 +223,6 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
     }
 }
 
-/// Spaces-watch follower + repair tick. Weak handles so dropping the service
-/// tears the loop down; the token ends it eagerly on shutdown.
 async fn spaces_task(
     inner: Weak<SpacesSyncInner>,
     mut spaces_rx: watch::Receiver<Vec<Space>>,
@@ -277,7 +230,7 @@ async fn spaces_task(
 ) {
     let mut repair = tokio::time::interval(REPAIR_INTERVAL);
     repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    repair.tick().await; // consume the immediate first tick
+    repair.tick().await;
     {
         let Some(inner) = inner.upgrade() else { return };
         let spaces = spaces_rx.borrow().clone();

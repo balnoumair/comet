@@ -1,18 +1,3 @@
-//! Restart round-trip + harness resume continuity (the "chats forget everything
-//! after an app restart" regression): the EMBED assembly (`EngineCore::assemble`)
-//! is run twice over one data dir, asserting
-//! - chats + transcripts survive a graceful shutdown → relaunch;
-//! - the next run in an existing chat carries the chat's stored harness-native
-//!   session id as `RunRequest.resume` (engine-owned, zeron sessions.ts:736);
-//! - a kill -9 style crash recovers the session id from the run journal
-//!   (zeron recoverDraft, sessions.ts:538-552) and stamps streaming entries
-//!   `aborted`;
-//! - resume is cwd-scoped (harness session stores are keyed by cwd);
-//! - a startup crash retries once with the resume kept, and a helper that is
-//!   down hard never tombstones the stored session id;
-//! - a steer with no live run after a restart dispatches as a new turn that
-//!   still resumes the prior conversation.
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,12 +35,6 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     }
 }
 
-/// Records every `RunRequest` it receives (the resume-injection probe). A
-/// successful run emits `SessionStarted{session_id}` … `Done{session_id}`;
-/// while `fail_starts` is positive, a run dies the way a crashed agent child
-/// does — an errored Done before any session starts — decrementing the
-/// counter (so a transient spawn blip is one failure, a helper that is down
-/// hard is `u32::MAX`).
 struct RecordingHarness {
     requests: RequestLog,
     session_id: String,
@@ -171,7 +150,6 @@ where
     }
 }
 
-/// Tolerant read for hot-polling predicates (mirrors e2e.rs `entries_now`).
 fn entries_now(core: &EngineCore) -> Vec<SessionMessageEntry> {
     core.doc_host
         .open(CHAT)
@@ -197,9 +175,6 @@ fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)>
         .map(|id| (id, chat.harness_session_cwd))
 }
 
-/// Create + name the chat row up front so the auto-titler (which runs its own
-/// harness request after a completed exchange on an UNTITLED chat) stays out
-/// of the recorded request log.
 fn pre_title(core: &EngineCore) {
     core.workspace
         .create_space("space-restart", &core.device_id, "/tmp", None, false)
@@ -212,8 +187,6 @@ fn pre_title(core: &EngineCore) {
         .expect("rename chat");
 }
 
-/// One full turn in a fresh engine over `dir`, then graceful shutdown — the
-/// "before restart" phase shared by the tests below.
 async fn run_one_turn_and_shutdown(dir: &std::path::Path, requests: &RequestLog, session: &str) {
     let core = assemble(
         dir,
@@ -252,7 +225,6 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
         "a chat's first run must start a fresh harness session"
     );
 
-    // Relaunch over the same data dir (the embedded-engine restart path).
     let core = assemble(
         &dir,
         RecordingHarness {
@@ -262,8 +234,6 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
         },
     );
 
-    // Sidebar state survived: the chat row is back with its cwd, preview, and
-    // the stored harness session (cwd-scoped).
     let chats = core.workspace.read_chats().expect("read chats");
     assert_eq!(chats.len(), 1, "chat row survives restart: {chats:#?}");
     assert_eq!(chats[0].id, CHAT);
@@ -274,7 +244,6 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
         Some(("hs-restart-1".into(), Some("/tmp".into())))
     );
 
-    // Transcript survived: user + completed assistant entry, texts intact.
     let entries = entries_now(&core);
     assert_eq!(
         entries.len(),
@@ -290,8 +259,6 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
         MessagePart::Text { text, .. } if text.contains("PINEAPPLE")
     ));
 
-    // The next run resumes the SAME harness conversation: the engine injects
-    // the stored session id even though the caller sent `resume: None`.
     queue_run(&core, "what was the codeword?", "/tmp", "msg-user-2");
     wait_for(
         || complete_assistant_count(&core) == 2,
@@ -307,7 +274,6 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
             "post-restart dispatch must resume the stored harness session"
         );
     }
-    // The fresh turn's session id replaces the stored one.
     assert_eq!(
         stored_harness_session(&core),
         Some(("hs-restart-2".into(), Some("/tmp".into())))
@@ -320,14 +286,8 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");
     std::fs::create_dir_all(&dir).unwrap();
-    // Pin the device id so the manufactured streaming entry counts as OURS.
     std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
 
-    // Manufacture the on-disk state a kill -9 mid-run leaves behind:
-    // - a chat doc snapshot whose assistant entry is still `streaming`;
-    // - a journal whose last event is NOT `Done` (run died mid-stream), holding
-    //   the only copy of the harness session id (the debounced workspace-row
-    //   write never landed).
     {
         let store = DocsStore::open(dir.join("profiles/local")).unwrap();
         let doc = SessionDoc::init(CHAT).unwrap();
@@ -396,19 +356,15 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     );
     assert_eq!(core.device_id, "dev-crash");
 
-    // Boot recovery stamped the abandoned streaming entry `aborted` …
     let entries = entries_now(&core);
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
-    // … and closed the stale journal with a synthetic Done.
     let journal = RunJournal::open(dir.join("profiles/local/journals")).unwrap();
     assert!(matches!(
         journal.last_event(CHAT).unwrap(),
         Some((_, AgentEvent::Done { .. }))
     ));
 
-    // The next run resumes the crashed conversation: the session id was
-    // recovered from the journal (its only surviving home).
     pre_title(&core);
     queue_run(&core, "keep going", "/tmp", "msg-user-2");
     wait_for(
@@ -424,10 +380,6 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     core.shutdown().await;
 }
 
-/// A harness whose stream stays OPEN after each turn's Done, serving follow-up
-/// turns from the steering mailbox — the persistent-session shape (codex; and
-/// claude's stream-json stdin). Counts `run()` calls to prove the engine
-/// reuses one child across turns instead of respawning.
 struct PersistentHarness {
     runs_started: Arc<Mutex<usize>>,
 }
@@ -487,8 +439,6 @@ impl Harness for PersistentHarness {
                     return;
                 }
             }
-            // Parked: serve follow-up turns from the mailbox until the
-            // engine hangs up (idle reap / interrupt / shutdown).
             let mut n = 1usize;
             while let Some(steer) = steering.recv().await {
                 n += 1;
@@ -536,8 +486,6 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     )
     .await;
 
-    // The session PARKS (zeron runsBySession): the second message routes into
-    // the live child instead of spawning a new one.
     queue_run(&core, "second", "/tmp", "msg-user-2");
     wait_for(
         || complete_assistant_count(&core) == 2,
@@ -568,8 +516,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
 
-    // Same manufactured kill -9 state as above, but FRESH: the streaming entry
-    // crashed moments ago, inside the 12h revival window.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -641,8 +587,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         },
     );
 
-    // The run is PICKED BACK UP without any user action (zeron: "not just
-    // eulogized"): recovery re-dispatches the crashed prompt itself.
     wait_for(
         || complete_assistant_count(&core) == 1,
         "auto-resumed turn to complete",
@@ -650,7 +594,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     .await;
 
     let entries = entries_now(&core);
-    // The aborted entry SAYS why it ended — and that the run is resuming.
     let aborted = entries
         .iter()
         .find(|e| e.status == Some(MessageStatus::Aborted))
@@ -663,7 +606,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         )),
         "aborted entry carries the visible interruption note"
     );
-    // Re-dispatch reuses the original user message id — never a duplicate.
     assert_eq!(
         entries
             .iter()
@@ -671,8 +613,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             .count(),
         1
     );
-    // The revived run continues the journal-recovered harness conversation.
-    // (An auto-title request may precede it — titling fires at dispatch.)
     let recorded = requests.lock().unwrap().clone();
     let revived = recorded
         .iter()
@@ -702,8 +642,6 @@ async fn resume_is_cwd_scoped() {
             fail_starts: Default::default(),
         },
     );
-    // Same chat, different launch directory: claude session stores are keyed
-    // by cwd, so the stored id must NOT be injected.
     queue_run(
         &core,
         "now from another project",
@@ -731,11 +669,6 @@ async fn startup_crash_retries_once_with_resume_kept() {
 
     run_one_turn_and_shutdown(&dir, &requests, "hs-live").await;
 
-    // Relaunch with a harness whose child dies at startup ONCE (a transient
-    // spawn blip). Since the ACP conversion a stale id falls back inside the
-    // harness (`session/load` → `session/new`), so a startup death never
-    // indicts the stored id: the retry must carry the SAME session id, not
-    // start fresh — and never tombstone it.
     let core = assemble(
         &dir,
         RecordingHarness {
@@ -751,7 +684,6 @@ async fn startup_crash_retries_once_with_resume_kept() {
     )
     .await;
 
-    // The crashed attempt, then exactly one retry — resume kept both times.
     {
         let log = requests.lock().unwrap();
         assert_eq!(log.len(), 3, "one crashed attempt + one retry");
@@ -763,7 +695,6 @@ async fn startup_crash_retries_once_with_resume_kept() {
         );
         assert_eq!(log[2].prompt, "second turn");
     }
-    // The retry reused the same user entry — no duplicates, no error turn.
     let entries = entries_now(&core);
     let users: Vec<_> = entries
         .iter()
@@ -771,7 +702,6 @@ async fn startup_crash_retries_once_with_resume_kept() {
         .collect();
     assert_eq!(users.len(), 2, "retry must not duplicate the user entry");
     assert_eq!(entries.len(), 4, "user+assistant per turn: {entries:#?}");
-    // The successful turn's session id replaces the stored one as usual.
     assert_eq!(
         stored_harness_session(&core),
         Some(("hs-next".into(), Some("/tmp".into())))
@@ -787,9 +717,6 @@ async fn persistent_startup_crash_keeps_stored_session_id() {
 
     run_one_turn_and_shutdown(&dir, &requests, "hs-live").await;
 
-    // A helper that is down hard: every spawn dies at startup. The old guess
-    // logic read this as "bad resume id" and tombstoned a perfectly good
-    // session — permanently, surviving restarts (user incident 2026-08-13).
     let core = assemble(
         &dir,
         RecordingHarness {
@@ -799,7 +726,6 @@ async fn persistent_startup_crash_keeps_stored_session_id() {
         },
     );
     queue_run(&core, "second turn", "/tmp", "msg-user-2");
-    // Crashed attempt + its single retry — then it must STOP (no spawn loop).
     wait_for(
         || requests.lock().unwrap().len() == 3,
         "crashed attempt and retry to be recorded",
@@ -812,9 +738,6 @@ async fn persistent_startup_crash_keeps_stored_session_id() {
         assert_eq!(log[1].resume.as_deref(), Some("hs-live"));
         assert_eq!(log[2].resume.as_deref(), Some("hs-live"));
     }
-    // THE fix: the stored id survives the startup failures — the next send
-    // (say, after the restart that heals the helper) resumes the same
-    // conversation.
     assert_eq!(
         stored_harness_session(&core),
         Some(("hs-live".into(), Some("/tmp".into())))
@@ -822,12 +745,6 @@ async fn persistent_startup_crash_keeps_stored_session_id() {
     core.shutdown().await;
 }
 
-/// Real-CLI proof of the whole regression fix: tell claude a codeword, restart
-/// the engine (fresh `EngineCore::assemble` over the same data dir), ask for
-/// the codeword back — the reply can only contain it if the second run resumed
-/// the first run's harness session. Ignored by default: needs an installed,
-/// authenticated `claude` CLI and spends real tokens (haiku, two tiny turns).
-/// Run with: `cargo test -p zeron-engine --test restart_resume -- --ignored`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires installed+authenticated claude CLI; spends tokens"]
 async fn real_claude_remembers_codeword_across_engine_restart() {
@@ -859,7 +776,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     };
 
     let core = assemble_real();
-    pre_title(&core); // keep the auto-titler from spending a second model call
+    pre_title(&core);
     core.doc_host
         .queue_command(
             CHAT,
@@ -884,7 +801,6 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     core.shutdown().await;
     drop(core);
 
-    // "App restart": a brand-new engine over the same data dir.
     let core = assemble_real();
     core.doc_host
         .queue_command(
@@ -932,9 +848,6 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
 
     run_one_turn_and_shutdown(&dir, &requests, "hs-steer").await;
 
-    // Relaunch: no live run, no in-process `last_request`. A steer must fall
-    // back to a new turn built from the chat's workspace row, resuming the
-    // prior harness conversation.
     let core = assemble(
         &dir,
         RecordingHarness {
