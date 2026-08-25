@@ -1,4 +1,4 @@
-//! zeron-engine — the local desktop backend: sessions, documents, journals,
+//! zeron-engine — the local backend: sessions, documents, journals,
 //! repositories, terminals, diffs, and the localhost RPC server.
 
 use std::io::Write;

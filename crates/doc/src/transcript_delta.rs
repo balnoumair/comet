@@ -6,8 +6,8 @@
 //! fallback when a diff would approach transcript size) or the changed
 //! entries only — during streaming that is one entry per tick.
 //!
-//! Both viewports share this module (the `zeron_proto::view` rule: derivations
-//! that must not diverge per surface live in one place).
+//! Every host shares this module: a framing rule that must not diverge per
+//! surface has exactly one implementation here.
 
 use serde::{Deserialize, Serialize};
 

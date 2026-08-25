@@ -21,7 +21,7 @@ pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 ///   output, so the fence is transport wrapping, never content (pre-fix,
 ///   every summary read "```console…").
 /// - Outputs that fit [`TOOL_OUTPUT_SUMMARY_MAX`] chars ride whole — a
-///   summary of a two-line output is more UI than the output.
+///   summary of a two-line output is more chrome than the output.
 /// - Bigger outputs keep the first non-empty line, capped, with a `…`
 ///   marker meaning "there was more".
 ///
@@ -140,7 +140,7 @@ pub enum MessagePart {
         /// Legacy local snapshot key for a full output, if present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_ref: Option<String>,
-        /// Full-output byte length, so the UI can say "Show full output (12 KB)".
+        /// Full-output byte length, so a host can say "Show full output (12 KB)".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_bytes: Option<u64>,
         /// Legacy local snapshot key for a full diff JSON, if present.

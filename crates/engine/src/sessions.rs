@@ -788,8 +788,8 @@ impl Inner {
 
     /// Bump the session's freshness on stream activity WITHOUT a status
     /// transition. Long silent-LOOKING stretches (thinking heartbeats, a big
-    /// tool input being generated) still carry events — the UI's 45s
-    /// staleness gate must not flip "Working" off mid-run. Throttled: a
+    /// tool input being generated) still carry events — the
+    /// `SESSION_STALE_MS` gate must not flip "Working" off mid-run. Throttled: a
     /// workspace-doc mirror per delta would be far too chatty.
     fn touch_session(&self, chat_id: &str) {
         const TOUCH_THROTTLE_MS: i64 = 10_000;
@@ -1285,7 +1285,7 @@ async fn drive_run(
     // open, so freshness must not depend on events arriving. Silent stretches
     // are normal and UNBOUNDED — a long tool call, redacted thinking, an
     // agent waiting on an external process, a question parked for an hour —
-    // and each starved the UI's 45s staleness gate in turn (working strip /
+    // and each starved the `SESSION_STALE_MS` gate in turn (working strip /
     // AwaitingInput dot vanishing mid-run, both user-reported). No stall
     // timeout here by design (a first port was rejected — agents may
     // legitimately be quiet for >10min): a live child means Working, dying
@@ -1590,7 +1590,7 @@ async fn drive_run(
         }
 
         // Any stream activity proves the run is alive — keep the session's
-        // freshness inside the UI's 45s staleness window (throttled), and
+        // freshness inside the `SESSION_STALE_MS` window (throttled), and
         // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
         last_stream_activity = tokio::time::Instant::now();

@@ -500,7 +500,7 @@ async fn run_session(session: Session) {
         );
         // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
         // when asked for — without this codex "thinks" in silence for minutes:
-        // nothing renders and the UI's 45s staleness gate flips Working off
+        // nothing renders and the `SESSION_STALE_MS` gate flips Working off
         // (user report: "not streaming, doesn't say it's working").
         p.insert("summary".into(), "auto".into());
         if let Some(model) = &request.model {
@@ -1019,7 +1019,7 @@ async fn run_session(session: Session) {
                             }
                             // A failed `turn/steer` does NOT mean the text is
                             // bad: most commonly the active turn finished
-                            // between the UI send and this request. Queue it
+                            // between the caller's send and this request. Queue it
                             // for redelivery as the next `turn/start` when the
                             // expected turn's end arrives (also the safe
                             // fallback for older Codex without steering).

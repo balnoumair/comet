@@ -11,7 +11,7 @@
 //! - a slow 2-minute repair tick (native watchers coalesce/drop events).
 //!
 //! Stamps are written ONLY on change, so steady state never grows the oplog.
-//! The UI reads `space.git_detected` straight from the local doc — branch
+//! A host reads `space.git_detected` straight from the local doc — branch
 //! pickers and the diff sidebar gate on it with zero extra RPCs.
 //!
 //! The repair tick also runs the orphan sweep: a chat created concurrently

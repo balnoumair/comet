@@ -1,5 +1,5 @@
 //! "Don't work in a project" against a real engine: a chat minted through the
-//! UI's exact wire shape (`Mutate createChat` with a `deviceId` and no
+//! host's exact wire shape (`Mutate createChat` with a `deviceId` and no
 //! `spaceId`) stores cwd `~`, spawns its run from the host's REAL home dir,
 //! and never mints a space row — the two failure modes of pre-#40 engines
 //! (a phantom project at root, and the run dying on the literal `~`).

@@ -138,7 +138,7 @@ pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcServic
 }
 
 async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
-    // Native viewports dial this socket with a bare `connect_async` and send
+    // Native hosts dial this socket with a bare `connect_async` and send
     // no `Origin` header. A browser always attaches `Origin` to a WebSocket
     // handshake and cannot forge or suppress it from script, and WebSockets
     // are exempt from the Same-Origin Policy — so only rejecting any handshake

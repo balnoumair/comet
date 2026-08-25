@@ -669,7 +669,7 @@ impl RegistryDoc {
         Ok(())
     }
 
-    /// LWW rename (settings UI; any device may write). `false` when no such row.
+    /// LWW rename (any device may write). `false` when no such row.
     pub fn rename_device(&mut self, device_id: &str, name: &str) -> Result<bool, DocError> {
         if !self.row_exists(KIND_DEVICES, device_id) {
             return Ok(false);

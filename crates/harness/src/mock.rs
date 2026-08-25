@@ -1,4 +1,4 @@
-//! Mock harness for engine/UI tests: replays a scripted event sequence.
+//! Mock harness for engine tests: replays a scripted event sequence.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -92,7 +92,7 @@ impl Harness for MockHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         // Optional pacing knob for demos/manual testing: `ZERON_MOCK_DELAY_MS`
-        // spaces the scripted events out so live-run UI states (working
+        // spaces the scripted events out so live-run states (working
         // indicator, streaming fade, trailing tool-group auto-open) are
         // observable. Unset (the default, and in tests) streams instantly.
         let delay_ms = std::env::var("ZERON_MOCK_DELAY_MS")
@@ -231,7 +231,8 @@ impl Harness for MockHarness {
         // Dev/testing knob: `ZERON_MOCK_MEND=1` appends a link/list-heavy
         // passage — bold-led list items, inline links, emphasis, strikethrough
         // — the shapes whose half-streamed markers the display mend
-        // (crates/ui markdown/mend.rs) must hold steady while streaming.
+        // (a host's incremental markdown renderer) must hold steady
+        // while streaming.
         let mock_mend = std::env::var("ZERON_MOCK_MEND")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -419,7 +420,7 @@ impl Harness for MockHarness {
                     AgentEvent::ToolCall {
                         id: "mock-code-tool".into(),
                         call: zeron_proto::ToolCall::Exec {
-                            command: "set -e\nfixture_in_original=0\ngrep -rn \"veil\" crates/ui/src | wc -l".into(),
+                            command: "set -e\nfixture_in_original=0\ngrep -rn \"veil\" crates/engine/src | wc -l".into(),
                         },
                     },
                     AgentEvent::ToolResult {

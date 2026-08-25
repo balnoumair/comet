@@ -1,6 +1,6 @@
 //! Uploads — local attachment staging for chat prompts and transcripts.
 //!
-//! The UI streams a file as base64 chunks (~60KB); chunks stage on disk under
+//! A host streams a file as base64 chunks (~60KB); chunks stage on disk under
 //! `{uploads_root}/tmp/{uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike
 //! in-memory buffers), and `commit` assembles them into
 //! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the

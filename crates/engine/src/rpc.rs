@@ -1316,7 +1316,7 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
-    /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
+    /// A host's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// Legacy account fields are tolerated for clients that reuse this helper.
     #[test]
     fn agent_account_params_accept_ui_shape() {

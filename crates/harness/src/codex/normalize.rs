@@ -96,7 +96,7 @@ fn tool_lifecycle(phase: Phase, id: String, call: ToolCall, is_error: bool) -> V
 }
 
 /// A `fileChange` item's `changes` array reduced to the typed [`ToolCall`] the
-/// UI renders: a lone `add` is a file write, a lone `update` an edit, anything
+/// Renders as: a lone `add` is a file write, a lone `update` an edit, anything
 /// else (deletes, multi-file changes) a patch.
 fn file_change_call(changes: &[(String, String)]) -> ToolCall {
     match changes {

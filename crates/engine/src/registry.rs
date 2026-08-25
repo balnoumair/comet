@@ -220,7 +220,7 @@ impl HarnessRegistry {
         Ok(())
     }
 
-    /// Best-effort atomic write (temp + rename, the ui-settings pattern).
+    /// Best-effort atomic write (temp + rename, the settings-file pattern).
     fn persist_prefs(&self) {
         let Some(path) = self
             .prefs_path

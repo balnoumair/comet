@@ -90,9 +90,9 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    // Legacy UI method names retained as inert protocol identifiers during the
-    // local-only migration. The local engine does not implement cloud auth or
-    // profile import operations.
+    // Account/organization method names retained as inert protocol
+    // identifiers: hosts still reference them, but the local engine implements
+    // no cloud auth or profile-import operation behind any of them.
     pub const AUTH_STATUS: &str = "AuthStatus";
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
@@ -176,7 +176,7 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 }
 
 /// Spawn an in-memory server for `service` and return a connected client.
-/// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
+/// Same envelopes, same dispatch loop as the WebSocket path — an in-process host
 /// transport (ARCHITECTURE §1 "zero serialization shortcuts").
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
@@ -291,7 +291,7 @@ mod tests {
             "handshake carrying an Origin header must be rejected"
         );
 
-        // A native viewport (no Origin) still connects and can call RPC — the
+        // A native host (no Origin) still connects and can call RPC — the
         // reject must not be a blanket denial.
         let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
         let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();

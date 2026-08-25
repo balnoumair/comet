@@ -34,7 +34,7 @@
 //! Usage probes: both providers expose the rate-limit view their own CLIs render
 //! (`/usage` in Claude Code, `/status` in Codex). Unlike zeron (fetch on every
 //! list, 60s cache), native only hits the network when `force_usage` is set —
-//! the default list stays offline-fast and deterministic; the UI passes
+//! the default list stays offline-fast and deterministic; the caller passes
 //! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
 //! non-forced lists in between.
 
@@ -1811,7 +1811,7 @@ fn wire_login_child(mut child: tokio::process::Child) -> LoginChildHandles {
 
 /// Wait briefly for the login child to print its authorize URL (empty when it
 /// exits or stays silent past the deadline — the flow still completes via
-/// poll; the UI just can't offer an open-browser button).
+/// poll; the caller just can't offer an open-browser button).
 async fn await_login_url(
     output: &Arc<Mutex<String>>,
     exit: &Arc<Mutex<Option<Option<i32>>>>,

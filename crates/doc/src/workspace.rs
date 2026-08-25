@@ -98,7 +98,7 @@ impl WorkspaceDoc {
         Ok(())
     }
 
-    /// LWW rename (settings UI; any device may write). `false` when no such row.
+    /// LWW rename (any device may write). `false` when no such row.
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("devices", device_id) else {
             return Ok(false);
@@ -258,7 +258,7 @@ impl WorkspaceDoc {
     }
 
     /// Synced seen marker (LWW) with a monotonic guard: no oplog write when the
-    /// stored stamp is already >= `at` (idempotence backstop — the UI also
+    /// stored stamp is already >= `at` (idempotence backstop — a host also
     /// guards on "currently unseen" before calling). `false` when no such row.
     pub fn set_chat_seen(&self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {

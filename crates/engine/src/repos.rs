@@ -1358,9 +1358,9 @@ mod tests {
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {
-        assert!(score("cmp rs", "crates/ui/src/composer.rs").is_some());
-        assert!(score("composer crates", "crates/ui/src/composer.rs").is_some());
-        assert!(score("xyzq", "crates/ui/src/composer.rs").is_none());
+        assert!(score("eng rs", "crates/engine/src/repos.rs").is_some());
+        assert!(score("repos crates", "crates/engine/src/repos.rs").is_some());
+        assert!(score("xyzq", "crates/engine/src/repos.rs").is_none());
     }
 
     #[test]

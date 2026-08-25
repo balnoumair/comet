@@ -147,7 +147,7 @@ fn model(
 /// toggle on Haiku; context-window select on the long-context families and
 /// fast mode on Opus 4.5+.
 ///
-/// `pub`: besides the discovery-side enrichment here, the UI's display-side
+/// `pub`: besides the discovery-side enrichment here, a host's display-side
 /// normalization borrows these labels so alias rows served by older engines
 /// still read with their version numbers ("Opus 5", not "Opus").
 pub fn static_models() -> Vec<Model> {

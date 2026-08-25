@@ -23,7 +23,7 @@ fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
-/// Truncate on a char boundary, marking the cut so the UI can say "truncated".
+/// Truncate on a char boundary, marking the cut so a host can say "truncated".
 pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_owned();
